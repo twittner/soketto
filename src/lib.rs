@@ -13,10 +13,32 @@
 //! [rfc6455]: https://tools.ietf.org/html/rfc6455
 
 pub mod base;
-pub mod extension;
-pub mod handshake;
-pub mod connection;
-
-mod tokio_framed;
+//pub mod extension;
+//pub mod handshake;
+//pub mod connection;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A parsing result.
+#[derive(Debug, Clone)]
+pub enum Parsing<T> {
+    /// Parsing completed.
+    Done {
+        /// The parsed value.
+        value: T,
+        /// The offset into the byte slice that has been consumed.
+        offset: usize
+    },
+    /// Parsing is incomplete and needs more data.
+    ///
+    /// If the `Option` is `Some` it indicates the minimum amount of additional
+    /// data needed, otherwise an indetermined amount is needed.
+    NeedMore(Option<usize>)
+}
+
+/// Helper function to allow casts from `usize` to `u64` only on platforms
+/// where the sizes are guaranteed to fit.
+#[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
+pub(crate) fn as_u64(a: usize) -> u64 {
+    a as u64
+}
