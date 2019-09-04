@@ -14,7 +14,7 @@
 #[cfg(feature = "deflate")]
 pub mod deflate;
 
-use crate::base::{Data, Header};
+use crate::base::Header;
 use std::{borrow::Cow, fmt};
 
 /// A websocket extension as per RFC 6455, section 9.
@@ -60,13 +60,13 @@ pub trait Extension: std::fmt::Debug {
     fn configure(&mut self, params: &[Param]) -> Result<(), crate::BoxError>;
 
     /// Encode a frame, given as frame header and payload data.
-    fn encode(&mut self, h: &mut Header, d: &mut Option<Data>) -> Result<(), crate::BoxError>;
+    fn encode(&mut self, h: &mut Header, d: &mut [u8]) -> Result<(), crate::BoxError>;
 
     /// Decode a frame.
     ///
     /// The frame header is given, as well as the accumulated payload data, i.e.
     /// the concatenated payload data of all message fragments.
-    fn decode(&mut self, h: &mut Header, d: &mut Option<Data>) -> Result<(), crate::BoxError>;
+    fn decode(&mut self, h: &mut Header, d: &mut [u8]) -> Result<(), crate::BoxError>;
 
     /// The reserved bits this extension uses.
     fn reserved_bits(&self) -> (bool, bool, bool) {
@@ -91,11 +91,11 @@ impl<E: Extension + ?Sized> Extension for Box<E> {
         (**self).configure(params)
     }
 
-    fn encode(&mut self, h: &mut Header, d: &mut Option<Data>) -> Result<(), crate::BoxError> {
+    fn encode(&mut self, h: &mut Header, d: &mut [u8]) -> Result<(), crate::BoxError> {
         (**self).encode(h, d)
     }
 
-    fn decode(&mut self, h: &mut Header, d: &mut Option<Data>) -> Result<(), crate::BoxError> {
+    fn decode(&mut self, h: &mut Header, d: &mut [u8]) -> Result<(), crate::BoxError> {
         (**self).decode(h, d)
     }
 

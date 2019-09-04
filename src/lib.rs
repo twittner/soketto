@@ -13,8 +13,8 @@
 //! [rfc6455]: https://tools.ietf.org/html/rfc6455
 
 pub mod base;
-//pub mod extension;
-//pub mod handshake;
+pub mod extension;
+pub mod handshake;
 //pub mod connection;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
