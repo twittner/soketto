@@ -11,12 +11,11 @@
 //! [handshake]: https://tools.ietf.org/html/rfc6455#section-4
 
 use crate::{Parsing, extension::{Param, Extension}};
-use futures::prelude::*;
 use http::StatusCode;
 use rand::Rng;
 use sha1::Sha1;
 use smallvec::SmallVec;
-use std::{borrow::{Borrow, Cow}, io, fmt, str};
+use std::{io, fmt, str};
 
 const SOKETTO_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -41,22 +40,25 @@ pub struct ClientHandshake<'a> {
     host: &'a str,
     resource: &'a str,
     origin: Option<&'a str>,
-    nonce: &'a [u8],
+    nonce: [u8; 32],
+    nonce_offset: usize,
     protocols: SmallVec<[&'a str; 4]>,
     extensions: SmallVec<[Box<dyn Extension + Send>; 4]>
 }
 
 impl<'a> ClientHandshake<'a> {
     /// Create a new client handshake coded for some host and resource.
-    pub fn new(host: &'a str, resource: &'a str, nonce_buf: &'a mut [u8; 32]) -> Self {
+    pub fn new(host: &'a str, resource: &'a str) -> Self {
+        let mut nonce = [0; 32];
         let mut buf = [0; 16];
         rand::thread_rng().fill(&mut buf);
-        let off = base64::encode_config_slice(&buf, base64::STANDARD, nonce_buf);
+        let offset = base64::encode_config_slice(&buf, base64::STANDARD, &mut nonce);
         ClientHandshake {
             host,
             resource,
             origin: None,
-            nonce: &nonce_buf[.. off],
+            nonce,
+            nonce_offset: offset,
             protocols: SmallVec::new(),
             extensions: SmallVec::new()
         }
@@ -64,7 +66,7 @@ impl<'a> ClientHandshake<'a> {
 
     /// Get a reference to the nonce created.
     pub fn ws_key(&self) -> &[u8] {
-        self.nonce
+        &self.nonce[.. self.nonce_offset]
     }
 
     /// Set the handshake origin header.
@@ -99,7 +101,7 @@ impl<'a> ClientHandshake<'a> {
         bytes.extend_from_slice(self.host.as_bytes());
         bytes.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: upgrade");
         bytes.extend_from_slice(b"\r\nSec-WebSocket-Key: ");
-        bytes.extend_from_slice(self.nonce);
+        bytes.extend_from_slice(self.ws_key());
         if let Some(o) = &self.origin {
             bytes.extend_from_slice(b"\r\nOrigin: ");
             bytes.extend_from_slice(o.as_bytes())
@@ -116,6 +118,7 @@ impl<'a> ClientHandshake<'a> {
         bytes.extend_from_slice(b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
     }
 
+    /// Decode the server response to this client request.
     pub fn decode_response(&mut self, bytes: &'a [u8]) -> Result<Parsing<Response<'a>>, Error> {
         let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
         let mut response = httparse::Response::new(&mut header_buf);
@@ -145,7 +148,7 @@ impl<'a> ClientHandshake<'a> {
         expect_ascii_header(response.headers, "Upgrade", "websocket")?;
         expect_ascii_header(response.headers, "Connection", "upgrade")?;
 
-        let nonce = self.nonce;
+        let nonce = self.ws_key();
         with_first_header(&response.headers, "Sec-WebSocket-Accept", |theirs| {
             let mut digest = Sha1::new();
             digest.update(nonce);
@@ -159,19 +162,18 @@ impl<'a> ClientHandshake<'a> {
 
         // Parse `Sec-WebSocket-Extensions` headers.
 
-        for h in response.headers.iter().filter(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_EXTENSIONS)) {
+        for h in response.headers.iter()
+            .filter(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_EXTENSIONS))
+        {
             configure_extensions(&mut self.extensions, std::str::from_utf8(h.value)?)?
         }
 
         // Match `Sec-WebSocket-Protocol` header.
 
-        let their_proto = response.headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_PROTOCOL));
-
         let mut selected_proto = None;
-
-        if let Some(tp) = their_proto {
+        if let Some(tp) = response.headers.iter()
+            .find(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_PROTOCOL))
+        {
             if let Some(p) = self.protocols.iter().find(|x| x.as_bytes() == tp.value) {
                 selected_proto = Some(*p)
             } else {
@@ -181,6 +183,143 @@ impl<'a> ClientHandshake<'a> {
 
         let response = Accepted { protocol: selected_proto };
         Ok(Parsing::Done { value: Response::Accepted(response), offset })
+    }
+}
+
+// Handshake server (responder) ///////////////////////////////////////////////////////////////////
+
+/// Server handshake.
+#[derive(Debug, Default)]
+pub struct ServerHandshake<'a> {
+    nonce: [u8; 32],
+    protocols: SmallVec<[&'a str; 4]>,
+    extensions: SmallVec<[Box<dyn Extension + Send>; 4]>
+}
+
+impl<'a> ServerHandshake<'a> {
+    /// Create a new server handshake codec.
+    pub fn new() -> Self {
+        ServerHandshake::default()
+    }
+
+    /// Add a protocol the server supports.
+    pub fn add_protocol(&mut self, p: &'a str) -> &mut Self {
+        self.protocols.push(p);
+        self
+    }
+
+    /// Add an extension the server supports.
+    pub fn add_extension(&mut self, e: Box<dyn Extension + Send>) -> &mut Self {
+        self.extensions.push(e);
+        self
+    }
+
+    /// Get back all extensions.
+    pub fn drain_extensions(&mut self) -> impl Iterator<Item = Box<dyn Extension + Send>> + '_ {
+        self.extensions.drain()
+    }
+
+    // Decode client request.
+    pub fn decode_request(&mut self, bytes: &'a [u8]) -> Result<Parsing<Request<'a>>, Error> {
+        let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
+        let mut request = httparse::Request::new(&mut header_buf);
+
+        let offset = match request.parse(bytes) {
+            Ok(httparse::Status::Complete(off)) => off,
+            Ok(httparse::Status::Partial) => return Ok(Parsing::NeedMore(None)),
+            Err(e) => return Err(Error::Http(Box::new(e)))
+        };
+
+        if request.method != Some("GET") {
+            return Err(Error::InvalidRequestMethod)
+        }
+        if request.version != Some(1) {
+            return Err(Error::UnsupportedHttpVersion)
+        }
+
+        // TODO: Host Validation
+        with_first_header(&request.headers, "Host", |_h| Ok(()))?;
+
+        expect_ascii_header(request.headers, "Upgrade", "websocket")?;
+        expect_ascii_header(request.headers, "Connection", "upgrade")?;
+        expect_ascii_header(request.headers, "Sec-WebSocket-Version", "13")?;
+
+        let ws_key = with_first_header(&request.headers, "Sec-WebSocket-Key", |k| {
+            Ok(k)
+        })?;
+
+        for h in request.headers.iter()
+            .filter(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_EXTENSIONS))
+        {
+            configure_extensions(&mut self.extensions, std::str::from_utf8(h.value)?)?
+        }
+
+        let mut protocols = SmallVec::new();
+        for p in request.headers.iter()
+            .filter(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_PROTOCOL))
+        {
+            if let Some(x) = self.protocols.iter().find(|x| x.as_bytes() == p.value) {
+                protocols.push(x.clone())
+            }
+        }
+
+        Ok(Parsing::Done { value: Request { ws_key, protocols }, offset })
+    }
+
+    // Encode server handshake response.
+    pub fn encode_response(&mut self, answer: Result<Accept<'a>, Reject>, bytes: &mut Vec<u8>) {
+        match answer {
+            Ok(accept) => {
+                let accept_value = {
+                    let mut digest = Sha1::new();
+                    digest.update(&accept.key);
+                    digest.update(KEY);
+                    let d = digest.digest().bytes();
+                    let n = base64::encode_config_slice(&d, base64::STANDARD, &mut self.nonce);
+                    &self.nonce[.. n]
+                };
+                bytes.extend_from_slice(b"HTTP/1.1 101 Switching Protocols");
+                bytes.extend_from_slice(b"\r\nServer: soketto-");
+                bytes.extend_from_slice(SOKETTO_VERSION.as_bytes());
+                bytes.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: upgrade");
+                bytes.extend_from_slice(b"\r\nSec-WebSocket-Accept: ");
+                bytes.extend_from_slice(accept_value);
+                if let Some(p) = accept.protocol {
+                    bytes.extend_from_slice(b"\r\nSec-WebSocket-Protocol: ");
+                    bytes.extend_from_slice(p.as_bytes())
+                }
+                append_extensions(self.extensions.iter().filter(|e| e.is_enabled()), bytes);
+                bytes.extend_from_slice(b"\r\n\r\n")
+            }
+            Err(reject) => {
+                bytes.extend_from_slice(b"HTTP/1.1 ");
+                let s = StatusCode::from_u16(reject.code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                bytes.extend_from_slice(s.as_str().as_bytes());
+                bytes.extend_from_slice(b" ");
+                bytes.extend_from_slice(s.canonical_reason().unwrap_or("N/A").as_bytes());
+                bytes.extend_from_slice(b"\r\n\r\n")
+            }
+        }
+    }
+}
+
+/// Client handshake request.
+#[derive(Debug)]
+pub struct Request<'a> {
+    ws_key: &'a [u8],
+    protocols: SmallVec<[&'a str; 4]>
+}
+
+impl<'a> Request<'a> {
+    /// A reference to the nonce.
+    pub fn key(&self) -> &[u8] {
+        self.ws_key
+    }
+
+    /// The protocols the client is proposing.
+    pub fn protocols(&self) -> impl Iterator<Item = &str> {
+        self.protocols.iter().cloned()
     }
 }
 
@@ -232,190 +371,46 @@ impl<'a> Redirect<'a> {
     }
 }
 
-// Handshake server (responder) ///////////////////////////////////////////////////////////////////
+/// Successful handshake response the server wants to send to the client.
+#[derive(Debug)]
+pub struct Accept<'a> {
+    key: &'a [u8],
+    protocol: Option<&'a str>
+}
 
-/// Server handshake codec.
-////#[derive(Debug, Default)]
-////pub struct Server<'a> {
-////    protocols: SmallVec<[Cow<'a, str>; 4]>,
-////    extensions: SmallVec<[Box<dyn Extension + Send>; 4]>
-////}
-////
-////impl<'a> Server<'a> {
-////    /// Create a new server handshake codec.
-////    pub fn new() -> Self {
-////        Server::default()
-////    }
-////
-////    /// Add a protocol the server supports.
-////    pub fn add_protocol(&mut self, p: impl Into<Cow<'a, str>>) -> &mut Self {
-////        self.protocols.push(p.into());
-////        self
-////    }
-////
-////    /// Add an extension the server supports.
-////    pub fn add_extension(&mut self, e: Box<dyn Extension + Send>) -> &mut Self {
-////        self.extensions.push(e);
-////        self
-////    }
-////
-////    /// Get back all extensions.
-////    pub fn drain_extensions(&mut self) -> impl Iterator<Item = Box<dyn Extension + Send>> + '_ {
-////        self.extensions.drain()
-////    }
-////}
-////
-/////// Client handshake request.
-////#[derive(Debug)]
-////pub struct Request<'a> {
-////    ws_key: SmallVec<[u8; 32]>,
-////    protocols: SmallVec<[Cow<'a, str>; 4]>
-////}
-////
-////impl<'a> Request<'a> {
-////    /// A reference to the nonce.
-////    pub fn key(&self) -> &[u8] {
-////        &self.ws_key
-////    }
-////
-////    /// The protocols the client is proposing.
-////    pub fn protocols(&self) -> impl Iterator<Item = &str> {
-////        self.protocols.iter().map(|p| p.as_ref())
-////    }
-////}
-////
-////impl<'a> Decoder for Server<'a> {
-////    type Item = Request<'a>;
-////    type Error = Error;
-////
-////    // Decode client request.
-////    fn decode(&mut self, bytes: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-////        let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
-////        let mut request = httparse::Request::new(&mut header_buf);
-////
-////        let offset = match request.parse(bytes) {
-////            Ok(httparse::Status::Complete(off)) => off,
-////            Ok(httparse::Status::Partial) => return Ok(None),
-////            Err(e) => return Err(Error::Http(Box::new(e)))
-////        };
-////
-////        if request.method != Some("GET") {
-////            return Err(Error::InvalidRequestMethod)
-////        }
-////        if request.version != Some(1) {
-////            return Err(Error::UnsupportedHttpVersion)
-////        }
-////
-////        // TODO: Host Validation
-////        with_first_header(&request.headers, "Host", |_h| Ok(()))?;
-////
-////        expect_ascii_header(request.headers, "Upgrade", "websocket")?;
-////        expect_ascii_header(request.headers, "Connection", "upgrade")?;
-////        expect_ascii_header(request.headers, "Sec-WebSocket-Version", "13")?;
-////
-////        let ws_key = with_first_header(&request.headers, "Sec-WebSocket-Key", |k| {
-////            Ok(SmallVec::from(k))
-////        })?;
-////
-////        for h in request.headers.iter().filter(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_EXTENSIONS)) {
-////            configure_extensions(&mut self.extensions, std::str::from_utf8(h.value)?)?
-////        }
-////
-////        let mut protocols = SmallVec::new();
-////        for p in request.headers.iter().filter(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_PROTOCOL)) {
-////            if let Some(x) = self.protocols.iter().find(|x| x.as_bytes() == p.value) {
-////                protocols.push(x.clone())
-////            }
-////        }
-////
-////        bytes.split_to(offset); // chop off the HTTP part we have processed
-////
-////        Ok(Some(Request { ws_key, protocols }))
-////    }
-////}
-////
-/////// Successful handshake response the server wants to send to the client.
-////#[derive(Debug)]
-////pub struct Accept<'a> {
-////    key: Cow<'a, [u8]>,
-////    protocol: Option<Cow<'a, str>>
-////}
-////
-////impl<'a> Accept<'a> {
-////    /// Create a new accept response.
-////    ///
-////    /// The `key` corresponds to the websocket key (nonce) the client has
-////    /// sent in its handshake request.
-////    pub fn new(key: impl Into<Cow<'a, [u8]>>) -> Self {
-////        Accept {
-////            key: key.into(),
-////            protocol: None
-////        }
-////    }
-////
-////    /// Set the protocol the server selected from the proposed ones.
-////    pub fn set_protocol(&mut self, p: impl Into<Cow<'a, str>>) -> &mut Self {
-////        self.protocol = Some(p.into());
-////        self
-////    }
-////}
-////
-/////// Error handshake response the server wants to send to the client.
-////#[derive(Debug)]
-////pub struct Reject {
-////    /// HTTP response status code.
-////    code: u16
-////}
-////
-////impl Reject {
-////    /// Create a new reject response with the given HTTP status code.
-////    pub fn new(code: u16) -> Self {
-////        Reject { code }
-////    }
-////}
-////
-////impl<'a> Encoder for Server<'a> {
-////    type Item = Result<Accept<'a>, Reject>;
-////    type Error = Error;
-////
-////    // Encode server handshake response.
-////    fn encode(&mut self, answer: Self::Item, buf: &mut BytesMut) -> Result<(), Self::Error> {
-////        match answer {
-////            Ok(accept) => {
-////                let mut key_buf = [0; 32];
-////                let accept_value = {
-////                    let mut digest = Sha1::new();
-////                    digest.update(accept.key.borrow());
-////                    digest.update(KEY);
-////                    let d = digest.digest().bytes();
-////                    let n = base64::encode_config_slice(&d, base64::STANDARD, &mut key_buf);
-////                    &key_buf[.. n]
-////                };
-////                buf.extend_from_slice(b"HTTP/1.1 101 Switching Protocols");
-////                buf.extend_from_slice(b"\r\nServer: soketto-");
-////                buf.extend_from_slice(SOKETTO_VERSION.as_bytes());
-////                buf.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: upgrade");
-////                buf.extend_from_slice(b"\r\nSec-WebSocket-Accept: ");
-////                buf.extend_from_slice(accept_value);
-////                if let Some(p) = accept.protocol {
-////                    buf.extend_from_slice(b"\r\nSec-WebSocket-Protocol: ");
-////                    buf.extend_from_slice(p.as_bytes())
-////                }
-////                append_extensions(self.extensions.iter().filter(|e| e.is_enabled()), buf);
-////                buf.extend_from_slice(b"\r\n\r\n")
-////            }
-////            Err(reject) => {
-////                buf.extend_from_slice(b"HTTP/1.1 ");
-////                let s = StatusCode::from_u16(reject.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-////                buf.extend_from_slice(s.as_str().as_bytes());
-////                buf.extend_from_slice(b" ");
-////                buf.extend_from_slice(s.canonical_reason().unwrap_or("N/A").as_bytes());
-////                buf.extend_from_slice(b"\r\n\r\n")
-////            }
-////        }
-////        Ok(())
-////    }
-////}
+impl<'a> Accept<'a> {
+    /// Create a new accept response.
+    ///
+    /// The `key` corresponds to the websocket key (nonce) the client has
+    /// sent in its handshake request.
+    pub fn new(key: &'a [u8]) -> Self {
+        Accept {
+            key: key,
+            protocol: None
+        }
+    }
+
+    /// Set the protocol the server selected from the proposed ones.
+    pub fn set_protocol(&mut self, p: &'a str) -> &mut Self {
+        self.protocol = Some(p);
+        self
+    }
+}
+
+/// Error handshake response the server wants to send to the client.
+#[derive(Debug)]
+pub struct Reject {
+    /// HTTP response status code.
+    code: u16
+}
+
+impl Reject {
+    /// Create a new reject response with the given HTTP status code.
+    pub fn new(code: u16) -> Self {
+        Reject { code }
+    }
+}
+
 
 /// Check a set of headers contains a specific one.
 fn expect_ascii_header(headers: &[httparse::Header], name: &str, ours: &str) -> Result<(), Error> {
@@ -486,28 +481,28 @@ fn configure_extensions(extensions: &mut [Box<dyn Extension + Send>], line: &str
 }
 
 // Write all extensions to the given buffer.
-fn append_extensions<'a, I>(extensions: I, buf: &mut Vec<u8>)
+fn append_extensions<'a, I>(extensions: I, bytes: &mut Vec<u8>)
 where
     I: IntoIterator<Item = &'a Box<dyn Extension + Send>>
 {
     let mut iter = extensions.into_iter().peekable();
 
     if iter.peek().is_some() {
-        buf.extend_from_slice(b"\r\nSec-WebSocket-Extensions: ")
+        bytes.extend_from_slice(b"\r\nSec-WebSocket-Extensions: ")
     }
 
     while let Some(e) = iter.next() {
-        buf.extend_from_slice(e.name().as_bytes());
+        bytes.extend_from_slice(e.name().as_bytes());
         for p in e.params() {
-            buf.extend_from_slice(b"; ");
-            buf.extend_from_slice(p.name().as_bytes());
+            bytes.extend_from_slice(b"; ");
+            bytes.extend_from_slice(p.name().as_bytes());
             if let Some(v) = p.value() {
-                buf.extend_from_slice(b"=");
-                buf.extend_from_slice(v.as_bytes())
+                bytes.extend_from_slice(b"=");
+                bytes.extend_from_slice(v.as_bytes())
             }
         }
         if iter.peek().is_some() {
-            buf.extend_from_slice(b", ")
+            bytes.extend_from_slice(b", ")
         }
     }
 }

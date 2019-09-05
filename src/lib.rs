@@ -32,7 +32,7 @@ pub enum Parsing<T> {
     /// Parsing is incomplete and needs more data.
     ///
     /// If the `Option` is `Some` it indicates the minimum amount of additional
-    /// data needed, otherwise an indetermined amount is needed.
+    /// data needed, otherwise an indetermined amount is required.
     NeedMore(Option<usize>)
 }
 

@@ -13,7 +13,7 @@
 // [frame/base.rs]: https://github.com/rustyhorde/twist/blob/449d8b75c2/src/frame/base.rs
 // [codec/base.rs]: https://github.com/rustyhorde/twist/blob/449d8b75c2/src/codec/base.rs
 
-//! A websocket [base] frame and accompanying tokio codec.
+//! A websocket [base frame] codec.
 //!
 //! [base]: https://tools.ietf.org/html/rfc6455#section-5.2
 
