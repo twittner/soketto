@@ -14,7 +14,7 @@
 pub mod base;
 pub mod extension;
 pub mod handshake;
-//pub mod connection;
+pub mod connection;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
