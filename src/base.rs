@@ -301,7 +301,7 @@ const TWO_EXT: u8 = 126;
 /// the actual payload length.
 const EIGHT_EXT: u8 = 127;
 
-/// Codec for encoding/decoding websocket [base] [`Frame`]s.
+/// Codec for encoding/decoding websocket [base] frames.
 ///
 /// [base]: https://tools.ietf.org/html/rfc6455#section-5.2
 #[derive(Debug, Clone)]

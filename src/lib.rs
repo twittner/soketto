@@ -7,8 +7,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-//! An implementation of the [RFC6455][rfc6455] websocket protocol as a set
-//! of tokio codecs.
+//! An implementation of the [RFC6455][rfc6455] websocket protocol.
 //!
 //! [rfc6455]: https://tools.ietf.org/html/rfc6455
 
@@ -31,8 +30,8 @@ pub enum Parsing<T> {
     },
     /// Parsing is incomplete and needs more data.
     ///
-    /// If the `Option` is `Some` it indicates the minimum amount of additional
-    /// data needed, otherwise an indetermined amount is required.
+    /// If the enclosed `Option` is `Some` it indicates the minimum amount
+    /// of additional data needed, otherwise an indetermined amount is required.
     NeedMore(Option<usize>)
 }
 
