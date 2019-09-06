@@ -16,11 +16,11 @@ pub mod extension;
 pub mod handshake;
 pub mod connection;
 
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
 /// A parsing result.
 #[derive(Debug, Clone)]
-pub enum Parsing<T> {
+pub enum Parsing<T, N = ()> {
     /// Parsing completed.
     Done {
         /// The parsed value.
@@ -29,10 +29,7 @@ pub enum Parsing<T> {
         offset: usize
     },
     /// Parsing is incomplete and needs more data.
-    ///
-    /// If the enclosed `Option` is `Some` it indicates the minimum amount
-    /// of additional data needed, otherwise an indetermined amount is required.
-    NeedMore(Option<usize>)
+    NeedMore(N)
 }
 
 /// Helper function to allow casts from `usize` to `u64` only on platforms

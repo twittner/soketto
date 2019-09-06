@@ -23,7 +23,7 @@ use std::{convert::TryFrom, fmt, io};
 // OpCode /////////////////////////////////////////////////////////////////////////////////////////
 
 /// Operation codes defined in [RFC6455](https://tools.ietf.org/html/rfc6455#section-5.2).
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub enum OpCode {
     /// A continuation frame of a fragmented message.
     Continue,
@@ -363,9 +363,9 @@ impl Codec {
     }
 
     /// Decode a websocket frame header.
-    pub fn decode_header(&self, bytes: &[u8]) -> Result<Parsing<Header>, Error> {
+    pub fn decode_header(&self, bytes: &[u8]) -> Result<Parsing<Header, usize>, Error> {
         if bytes.len() < 2 {
-            return Ok(Parsing::NeedMore(Some(2 - bytes.len())))
+            return Ok(Parsing::NeedMore(2 - bytes.len()))
         }
 
         let first = bytes[0];
@@ -408,7 +408,7 @@ impl Codec {
         let len: u64 = match second & 0x7F {
             TWO_EXT => {
                 if bytes.len() < offset + 2 {
-                    return Ok(Parsing::NeedMore(Some(offset + 2 - bytes.len())))
+                    return Ok(Parsing::NeedMore(offset + 2 - bytes.len()))
                 }
                 let len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
                 offset += 2;
@@ -416,7 +416,7 @@ impl Codec {
             }
             EIGHT_EXT => {
                 if bytes.len() < offset + 8 {
-                    return Ok(Parsing::NeedMore(Some(offset + 8 - bytes.len())))
+                    return Ok(Parsing::NeedMore(offset + 8 - bytes.len()))
                 }
                 let mut b = [0; 8];
                 b.copy_from_slice(&bytes[offset .. offset + 8]);
@@ -444,7 +444,7 @@ impl Codec {
 
         if header.is_masked() {
             if bytes.len() < offset + 4 {
-                return Ok(Parsing::NeedMore(Some(offset + 4 - bytes.len())))
+                return Ok(Parsing::NeedMore(offset + 4 - bytes.len()))
             }
             let mut b = [0; 4];
             b.copy_from_slice(&bytes[offset .. offset + 4]);
@@ -453,23 +453,6 @@ impl Codec {
         }
 
         Ok(Parsing::Done { value: header, offset })
-    }
-
-    /// Given a header, decode the payload data.
-    pub fn decode_payload<'a>(&self, header: &Header, bytes: &'a mut [u8]) -> Parsing<&'a [u8]> {
-        let len = header.payload_len();
-
-        if len == 0 {
-            return Parsing::Done { value: &[], offset: 0 }
-        }
-
-        if bytes.len() < len {
-            return Parsing::NeedMore(Some(len - bytes.len()))
-        }
-
-        self.apply_mask(&header, &mut bytes[.. len]);
-
-        Parsing::Done { value: &bytes[.. len], offset: len }
     }
 
     /// Encode a websocket frame header.
@@ -621,7 +604,7 @@ mod test {
         let partial_header: &[u8] = &[0x89];
         assert_matches! {
             Codec::new().decode_header(partial_header),
-            Ok(Parsing::NeedMore(Some(1)))
+            Ok(Parsing::NeedMore(1))
         }
     }
 
@@ -630,12 +613,12 @@ mod test {
         let partial_length_1: &[u8] = &[0x89, 0xFE, 0x01];
         assert_matches! {
             Codec::new().decode_header(partial_length_1),
-            Ok(Parsing::NeedMore(Some(1)))
+            Ok(Parsing::NeedMore(1))
         }
         let partial_length_2: &[u8] = &[0x89, 0xFF, 0x01, 0x02, 0x03, 0x04];
         assert_matches! {
             Codec::new().decode_header(partial_length_2),
-            Ok(Parsing::NeedMore(Some(4)))
+            Ok(Parsing::NeedMore(4))
         }
     }
 
@@ -644,7 +627,7 @@ mod test {
         let partial_mask: &[u8] = &[0x82, 0xFE, 0x01, 0x02, 0x00, 0x00];
         assert_matches! {
             Codec::new().decode_header(partial_mask),
-            Ok(Parsing::NeedMore(Some(2)))
+            Ok(Parsing::NeedMore(2))
         }
     }
 
@@ -652,10 +635,7 @@ mod test {
     fn decode_partial_payload() {
         let partial_payload: &mut [u8] = &mut [0x82, 0x85, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00];
         if let Ok(Parsing::Done { value, offset }) = Codec::new().decode_header(partial_payload) {
-            assert_matches! {
-                Codec::new().decode_payload(&value, &mut partial_payload[offset ..]),
-                Parsing::NeedMore(Some(3))
-            }
+            assert_eq!(3, value.payload_len() - (partial_payload.len() - offset))
         } else {
             assert!(false)
         }

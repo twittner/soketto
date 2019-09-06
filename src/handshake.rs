@@ -146,9 +146,9 @@ pub enum Error {
     /// The server returned a protocol we did not ask for.
     UnsolicitedProtocol,
     /// An extension produced an error while encoding or decoding.
-    Extension(crate::BoxError),
+    Extension(crate::BoxedError),
     /// The HTTP entity could not be parsed successfully.
-    Http(crate::BoxError),
+    Http(crate::BoxedError),
     /// UTF-8 decoding failed.
     Utf8(std::str::Utf8Error),
 

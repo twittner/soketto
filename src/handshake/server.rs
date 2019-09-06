@@ -68,7 +68,7 @@ impl<'a> Server<'a> {
 
         let offset = match request.parse(bytes) {
             Ok(httparse::Status::Complete(off)) => off,
-            Ok(httparse::Status::Partial) => return Ok(Parsing::NeedMore(None)),
+            Ok(httparse::Status::Partial) => return Ok(Parsing::NeedMore(())),
             Err(e) => return Err(Error::Http(Box::new(e)))
         };
 
