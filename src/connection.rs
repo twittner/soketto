@@ -44,7 +44,7 @@ pub struct Connection<T> {
     socket: T,
     codec: base::Codec,
     extensions: SmallVec<[Box<dyn Extension + Send>; 4]>,
-    control_buffer: Vec<u8>,
+    control_buffer: Vec<u8>, // buffer for interleaved control frames
     max_buffer_size: usize,
     validate_utf8: bool,
     is_closed: bool

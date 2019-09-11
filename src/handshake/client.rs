@@ -111,7 +111,7 @@ impl<'a> Client<'a> {
     }
 
     /// Decode the server response to this client request.
-    pub fn decode_response<'b>(&mut self, bytes: &'b [u8]) -> Result<Parsing<Response<'b>>, Error> {
+    pub fn decode_response<'b>(&mut self, bytes: &'b [u8]) -> Result<Parsing<ServerResponse<'b>>, Error> {
         let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
         let mut response = httparse::Response::new(&mut header_buf);
 
@@ -132,11 +132,11 @@ impl<'a> Client<'a> {
                     Ok(std::str::from_utf8(loc)?)
                 })?;
                 let response = Redirect { status_code: code, location };
-                return Ok(Parsing::Done { value: Response::Redirect(response), offset })
+                return Ok(Parsing::Done { value: ServerResponse::Redirect(response), offset })
             }
             other => {
                 let response = Rejected { code: other.unwrap_or(0) };
-                return Ok(Parsing::Done { value: Response::Rejected(response), offset })
+                return Ok(Parsing::Done { value: ServerResponse::Rejected(response), offset })
             }
         }
 
@@ -177,13 +177,13 @@ impl<'a> Client<'a> {
         }
 
         let response = Accepted { protocol: selected_proto };
-        Ok(Parsing::Done { value: Response::Accepted(response), offset })
+        Ok(Parsing::Done { value: ServerResponse::Accepted(response), offset })
     }
 }
 
 /// Handshake response received from the server.
 #[derive(Debug)]
-pub enum Response<'a> {
+pub enum ServerResponse<'a> {
     /// The server has accepted our request.
     Accepted(Accepted<'a>),
     /// The server is redirecting us to some other location.

@@ -62,7 +62,7 @@ impl<'a> Server<'a> {
     }
 
     // Decode client handshake request.
-    pub fn decode_request(&mut self, bytes: &'a [u8]) -> Result<Parsing<Request<'a>>, Error> {
+    pub fn decode_request<'b>(&mut self, bytes: &'b [u8]) -> Result<Parsing<ClientRequest<'b>>, Error> {
         let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
         let mut request = httparse::Request::new(&mut header_buf);
 
@@ -100,12 +100,12 @@ impl<'a> Server<'a> {
         for p in request.headers.iter()
             .filter(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_PROTOCOL))
         {
-            if let Some(x) = self.protocols.iter().find(|x| x.as_bytes() == p.value) {
-                protocols.push(x.clone())
+            if self.protocols.iter().find(|x| x.as_bytes() == p.value).is_some() {
+                protocols.push(std::str::from_utf8(p.value)?)
             }
         }
 
-        Ok(Parsing::Done { value: Request { ws_key, protocols }, offset })
+        Ok(Parsing::Done { value: ClientRequest { ws_key, protocols }, offset })
     }
 
     // Encode server handshake response.
@@ -149,12 +149,12 @@ impl<'a> Server<'a> {
 
 /// Handshake request received from the client.
 #[derive(Debug)]
-pub struct Request<'a> {
+pub struct ClientRequest<'a> {
     ws_key: &'a [u8],
     protocols: SmallVec<[&'a str; 4]>
 }
 
-impl<'a> Request<'a> {
+impl<'a> ClientRequest<'a> {
     /// A reference to the nonce.
     pub fn key(&self) -> &[u8] {
         self.ws_key

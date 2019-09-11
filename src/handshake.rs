@@ -17,8 +17,8 @@ use crate::extension::{Param, Extension};
 use smallvec::SmallVec;
 use std::{io, fmt, str};
 
-pub use client::Client;
-pub use server::Server;
+pub use client::{Client, ServerResponse};
+pub use server::{Server, ClientRequest};
 
 // Defined in RFC6455 and used to generate the `Sec-WebSocket-Accept` header
 // in the server handshake response.
