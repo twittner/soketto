@@ -15,9 +15,6 @@ pub mod base;
 pub mod extension;
 pub mod handshake;
 pub mod connection;
-mod websocket;
-
-pub use websocket::WebSocket;
 
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 

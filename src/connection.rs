@@ -139,6 +139,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
 
             let mut header = self.receive_header().await?;
+            trace!("read: {:?}", header);
+
             let n = header.payload_len();
 
             if header.opcode().is_control() {
@@ -250,10 +252,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         let mut buf = [0; 14];
         let mut off = 0;
         loop {
-            match self.codec.decode_header(&buf)? {
+            match self.codec.decode_header(&buf[.. off])? {
                 Parsing::Done { value: header, .. } => return Ok(header),
                 Parsing::NeedMore(n) => {
-                    debug_assert!(off + n < 16);
+                    debug_assert!(n > 0 && off + n < 16);
                     self.socket.read_exact(&mut buf[off .. off + n]).await?;
                     off += n
                 }

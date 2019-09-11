@@ -10,7 +10,8 @@
 //!
 //! [handshake]: https://tools.ietf.org/html/rfc6455#section-4
 
-use crate::{Parsing, extension::Extension};
+use crate::{Parsing, connection::{Connection, Mode}, extension::Extension};
+use futures::prelude::*;
 use sha1::Sha1;
 use smallvec::SmallVec;
 use std::{fmt, str};
@@ -26,9 +27,13 @@ use super::{
     with_first_header
 };
 
+const BLOCK_SIZE: usize = 4096;
+
 /// Websocket client handshake.
 #[derive(Debug)]
-pub struct Client<'a> {
+pub struct Client<'a, T> {
+    /// The underlying async I/O resource.
+    socket: T,
     /// The HTTP host to send the handshake to.
     host: &'a str,
     /// The HTTP host ressource.
@@ -45,10 +50,11 @@ pub struct Client<'a> {
     extensions: SmallVec<[Box<dyn Extension + Send>; 4]>
 }
 
-impl<'a> Client<'a> {
+impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
     /// Create a new client handshake for some host and resource.
-    pub fn new(host: &'a str, resource: &'a str) -> Self {
+    pub fn new(socket: T, host: &'a str, resource: &'a str) -> Self {
         Client {
+            socket,
             host,
             resource,
             origin: None,
@@ -82,40 +88,95 @@ impl<'a> Client<'a> {
         self.extensions.drain()
     }
 
+    /// Initiate client handshake request to server and get back the response.
+    pub async fn handshake<'b>(&mut self, buf: &'b mut Vec<u8>) -> Result<ServerResponse<'b>, Error> {
+        buf.clear();
+        self.encode_request(buf);
+        self.socket.write_all(buf).await?;
+        self.socket.flush().await?;
+
+        buf.clear();
+        let mut offset = 0;
+        loop {
+            // Here is what we would like to write:
+            //
+            //   if buf.len() == offset {
+            //       buf.resize(offset + BLOCK_SIZE, 0)
+            //   }
+            //   offset += self.socket.read(&mut buf[offset ..]).await?;
+            //   if let Parsing::Done { value, .. } = self.decode_response(&buf[.. offset])? {
+            //       return Ok(value)
+            //   }
+            //
+            // But because `&buf[.. offset]` has lifetime 'b (it backs the
+            // `ServerResponse<'b>`), the borrow checker will not allow us
+            // to `resize` `buf` because it means a second mutable borrow
+            // during the lifetime of 'b (on the next loop iteration).
+            // Note that this is safe because we will only modify `buf` if
+            // we do not return a borrow.
+            if buf.len() == offset {
+                buf.resize(offset + BLOCK_SIZE, 0)
+            }
+            let buf_slice = {
+                let p = buf.as_mut_ptr();
+                let n = buf.len();
+                unsafe { // NOTE
+                    std::slice::from_raw_parts_mut(p, n)
+                }
+            };
+            offset += self.socket.read(&mut buf_slice[offset ..]).await?;
+            if let Parsing::Done { value, .. } = self.decode_response(&buf_slice[.. offset])? {
+                return Ok(value)
+            }
+        }
+    }
+
+    /// Turn this handshake into a [`Connection`].
+    ///
+    /// If `take_over_extensions` is true, the extensions from this
+    /// handshake will be set on the `Connection` returned.
+    pub fn into_connection(mut self, take_over_extensions: bool) -> Connection<T> {
+        let mut c = Connection::new(self.socket, Mode::Client);
+        if take_over_extensions {
+            c.add_extensions(self.extensions.drain());
+        }
+        c
+    }
+
     /// Encode the client handshake as a request, ready to be sent to the server.
-    pub fn encode_request(&mut self, bytes: &mut Vec<u8>) {
-        let buf: [u8; 16] = rand::random();
-        self.nonce_offset = base64::encode_config_slice(&buf, base64::STANDARD, &mut self.nonce);
-        bytes.extend_from_slice(b"GET ");
-        bytes.extend_from_slice(self.resource.as_bytes());
-        bytes.extend_from_slice(b" HTTP/1.1");
-        bytes.extend_from_slice(b"\r\nHost: ");
-        bytes.extend_from_slice(self.host.as_bytes());
-        bytes.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: upgrade");
-        bytes.extend_from_slice(b"\r\nSec-WebSocket-Key: ");
-        bytes.extend_from_slice(&self.nonce[.. self.nonce_offset]);
+    fn encode_request(&mut self, buf: &mut Vec<u8>) {
+        let nonce: [u8; 16] = rand::random();
+        self.nonce_offset = base64::encode_config_slice(&nonce, base64::STANDARD, &mut self.nonce);
+        buf.extend_from_slice(b"GET ");
+        buf.extend_from_slice(self.resource.as_bytes());
+        buf.extend_from_slice(b" HTTP/1.1");
+        buf.extend_from_slice(b"\r\nHost: ");
+        buf.extend_from_slice(self.host.as_bytes());
+        buf.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: upgrade");
+        buf.extend_from_slice(b"\r\nSec-WebSocket-Key: ");
+        buf.extend_from_slice(&self.nonce[.. self.nonce_offset]);
         if let Some(o) = &self.origin {
-            bytes.extend_from_slice(b"\r\nOrigin: ");
-            bytes.extend_from_slice(o.as_bytes())
+            buf.extend_from_slice(b"\r\nOrigin: ");
+            buf.extend_from_slice(o.as_bytes())
         }
         if let Some((last, prefix)) = self.protocols.split_last() {
-            bytes.extend_from_slice(b"\r\nSec-WebSocket-Protocol: ");
+            buf.extend_from_slice(b"\r\nSec-WebSocket-Protocol: ");
             for p in prefix {
-                bytes.extend_from_slice(p.as_bytes());
-                bytes.extend_from_slice(b",")
+                buf.extend_from_slice(p.as_bytes());
+                buf.extend_from_slice(b",")
             }
-            bytes.extend_from_slice(last.as_bytes())
+            buf.extend_from_slice(last.as_bytes())
         }
-        append_extensions(&self.extensions, bytes);
-        bytes.extend_from_slice(b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        append_extensions(&self.extensions, buf);
+        buf.extend_from_slice(b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
     }
 
     /// Decode the server response to this client request.
-    pub fn decode_response<'b>(&mut self, bytes: &'b [u8]) -> Result<Parsing<ServerResponse<'b>>, Error> {
+    fn decode_response<'b>(&mut self, buf: &'b [u8]) -> Result<Parsing<ServerResponse<'b>>, Error> {
         let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
         let mut response = httparse::Response::new(&mut header_buf);
 
-        let offset = match response.parse(bytes) {
+        let offset = match response.parse(buf) {
             Ok(httparse::Status::Complete(off)) => off,
             Ok(httparse::Status::Partial) => return Ok(Parsing::NeedMore(())),
             Err(e) => return Err(Error::Http(Box::new(e)))

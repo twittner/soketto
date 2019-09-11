@@ -16,7 +16,7 @@
 
 use assert_matches::assert_matches;
 use async_std::{net::TcpStream, task};
-use soketto::{BoxedError, WebSocket, handshake};
+use soketto::{BoxedError, handshake};
 use std::str::FromStr;
 
 const SOKETTO_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -24,96 +24,68 @@ const SOKETTO_VERSION: &str = env!("CARGO_PKG_VERSION");
 fn main() -> Result<(), BoxedError> {
     env_logger::init();
     task::block_on(async {
-        let n = num_of_cases().await?;
+        let mut buf = Vec::new();
+        let n = num_of_cases(&mut buf).await?;
         for i in 1 ..= n {
-            if let Err(e) = run_case(i).await {
+            if let Err(e) = run_case(i, &mut buf).await {
                 log::debug!("case {}: {:?}", i, e)
             }
         }
-//        update_report()?;
+        update_report(&mut buf).await?;
         Ok(())
     })
 }
 
-async fn num_of_cases() -> Result<usize, BoxedError> {
+async fn num_of_cases(buf: &mut Vec<u8>) -> Result<usize, BoxedError> {
     let s = TcpStream::connect("127.0.0.1:9001").await?;
-    let mut ws = WebSocket::client(s);
-    let mut hs = handshake::Client::new("127.0.0.1:9001", "/getCaseCount");
-    assert_matches!(ws.handshake(&mut hs).await?, handshake::ServerResponse::Accepted(_));
-    let mut c = ws.into_connection();
-    let mut v = Vec::new();
-    assert!(c.receive(&mut v).await?);
-    Ok(usize::from_str(std::str::from_utf8(&v)?)?)
+    let mut c = new_client(s, "/getCaseCount");
+    assert_matches!(c.handshake(buf).await?, handshake::ServerResponse::Accepted(_));
+    let mut c = c.into_connection(true);
+    assert!(c.receive(buf).await?);
+    Ok(usize::from_str(std::str::from_utf8(buf)?)?)
 }
 
-async fn run_case(n: usize) -> Result<(), BoxedError> {
+async fn run_case(n: usize, buf: &mut Vec<u8>) -> Result<(), BoxedError> {
     let resource = format!("/runCase?case={}&agent=soketto-{}", n, SOKETTO_VERSION);
     let s = TcpStream::connect("127.0.0.1:9001").await?;
-    let mut ws = WebSocket::client(s);
-    let mut hs = handshake::Client::new("127.0.0.1:9001", &resource);
-    assert_matches!(ws.handshake(&mut hs).await?, handshake::ServerResponse::Accepted(_));
-    let mut c = ws.into_connection();
-    let mut v = Vec::new();
+    let mut c = new_client(s, &resource);
+    assert_matches!(c.handshake(buf).await?, handshake::ServerResponse::Accepted(_));
+    let mut c = c.into_connection(true);
+    c.validate_utf8(true);
     loop {
-        v.clear();
-        let is_text = c.receive(&mut v).await?;
-        if v.is_empty() {
+        buf.clear();
+        let is_text = c.receive(buf).await?;
+        if buf.is_empty() {
             break
         }
         if is_text {
-            c.send_text(&mut v).await?
+            c.send_text(buf).await?
         } else {
-            c.send_binary(&mut v).await?
+            c.send_binary(buf).await?
         }
     }
     Ok(())
 }
-//
-//fn update_report() -> Result<(), Box<dyn error::Error>> {
-//    let addr = "127.0.0.1:9001".parse().unwrap();
-//    TcpStream::connect(&addr)
-//        .map_err(|e| Box::new(e) as Box<dyn error::Error>)
-//        .and_then(|socket| {
-//            let resource = format!("/updateReports?agent=soketto-{}", SOKETTO_VERSION);
-//            let client = handshake::Client::new("127.0.0.1:9001", resource);
-//            tokio::codec::Framed::new(socket, client)
-//                .send(())
-//                .map_err(|e| Box::new(e) as Box<dyn error::Error>)
-//                .and_then(|framed| {
-//                    framed.into_future().map_err(|(e, _)| Box::new(e) as Box<dyn error::Error>)
-//                })
-//                .and_then(|(response, framed)| {
-//                    if response.is_none() {
-//                        let e: io::Error = io::ErrorKind::ConnectionAborted.into();
-//                        return Either::A(future::err(Box::new(e) as Box<dyn error::Error>))
-//                    }
-//                    let mut framed = {
-//                        let codec = base::Codec::new();
-//                        let old = framed.into_parts();
-//                        let mut new = FramedParts::new(old.io, codec);
-//                        new.read_buf = old.read_buf;
-//                        new.write_buf = old.write_buf;
-//                        let framed = Framed::from_parts(new);
-//                        connection::Connection::from_framed(framed, connection::Mode::Client)
-//                    };
-//                    Either::B(future::poll_fn(move || {
-//                        framed.close().map_err(|e| Box::new(e) as Box<dyn error::Error>)
-//                    }))
-//                })
-//        })
-//        .wait()
-//}
-//
-//#[cfg(not(feature = "deflate"))]
-//fn new_client<'a>(path: impl Into<Cow<'a, str>>) -> handshake::Client<'a> {
-//    handshake::Client::new("127.0.0.1:9001", path)
-//}
-//
-//#[cfg(feature = "deflate")]
-//fn new_client<'a>(path: impl Into<Cow<'a, str>>) -> handshake::Client<'a> {
-//    let mut client = handshake::Client::new("127.0.0.1:9001", path);
-//    let deflate = soketto::extension::deflate::Deflate::new(connection::Mode::Client);
-//    client.add_extension(Box::new(deflate));
-//    client
-//}
+
+async fn update_report(buf: &mut Vec<u8>) -> Result<(), BoxedError> {
+    let resource = format!("/updateReports?agent=soketto-{}", SOKETTO_VERSION);
+    let s = TcpStream::connect("127.0.0.1:9001").await?;
+    let mut c = new_client(s, &resource);
+    assert_matches!(c.handshake(buf).await?, handshake::ServerResponse::Accepted(_));
+    c.into_connection(true).close().await?;
+    Ok(())
+}
+
+#[cfg(not(feature = "deflate"))]
+fn new_client(socket: TcpStream, path: &str) -> handshake::Client<'_, TcpStream> {
+    handshake::Client::new(socket, "127.0.0.1:9001", path)
+}
+
+#[cfg(feature = "deflate")]
+fn new_client(socket: TcpStream, path: &str) -> handshake::Client<'_, TcpStream> {
+    let mut client = handshake::Client::new(socket, "127.0.0.1:9001", path);
+    let deflate = soketto::extension::deflate::Deflate::new(soketto::connection::Mode::Client);
+    client.add_extension(Box::new(deflate));
+    client
+}
 

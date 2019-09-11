@@ -10,7 +10,8 @@
 //!
 //! [handshake]: https://tools.ietf.org/html/rfc6455#section-4
 
-use crate::{Parsing, extension::Extension};
+use crate::{Parsing, connection::{Connection, Mode}, extension::Extension};
+use futures::prelude::*;
 use http::StatusCode;
 use sha1::Sha1;
 use smallvec::SmallVec;
@@ -27,21 +28,27 @@ use super::{
     with_first_header
 };
 
+const BLOCK_SIZE: usize = 4096;
 const SOKETTO_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Websocket handshake client.
-#[derive(Debug, Default)]
-pub struct Server<'a> {
+#[derive(Debug)]
+pub struct Server<'a, T> {
+    socket: T,
     /// Protocols the server supports.
     protocols: SmallVec<[&'a str; 4]>,
     /// Extensions the server supports.
     extensions: SmallVec<[Box<dyn Extension + Send>; 4]>
 }
 
-impl<'a> Server<'a> {
+impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     /// Create a new server handshake.
-    pub fn new() -> Self {
-        Server::default()
+    pub fn new(socket: T) -> Self {
+        Server {
+            socket,
+            protocols: SmallVec::new(),
+            extensions: SmallVec::new()
+        }
     }
 
     /// Add a protocol the server supports.
@@ -61,12 +68,71 @@ impl<'a> Server<'a> {
         self.extensions.drain()
     }
 
+    /// Await an incoming client handshake request.
+    pub async fn receive_request<'b>(&mut self, buf: &'b mut Vec<u8>) -> Result<ClientRequest<'b>, Error> {
+        buf.clear();
+        let mut offset = 0;
+        loop {
+            // Here is what we would like to write:
+            //
+            //   if buf.len() == offset {
+            //       buf.resize(offset + BLOCK_SIZE, 0)
+            //   }
+            //   offset += self.socket.read(&mut buf[offset ..]).await?;
+            //   if let Parsing::Done { value, .. } = self.decode_request(&buf[.. offset])? {
+            //       return Ok(value)
+            //   }
+            //
+            // But because `&buf[.. offset]` has lifetime 'b (it backs the
+            // `ClientRequest<'b>`), the borrow checker will not allow us
+            // to `resize` `buf` because it means a second mutable borrow
+            // during the lifetime of 'b (on the next loop iteration).
+            // Note that this is safe because we will only modify `buf` if
+            // we do not return a borrow.
+            if buf.len() == offset {
+                buf.resize(offset + BLOCK_SIZE, 0)
+            }
+            let buf_slice = {
+                let p = buf.as_mut_ptr();
+                let n = buf.len();
+                unsafe { // NOTE
+                    std::slice::from_raw_parts_mut(p, n)
+                }
+            };
+            offset += self.socket.read(&mut buf_slice[offset ..]).await?;
+            if let Parsing::Done { value, .. } = self.decode_request(&buf_slice[.. offset])? {
+                return Ok(value)
+            }
+        }
+    }
+
+    /// Respond to the client.
+    pub async fn send_response(&mut self, buf: &mut Vec<u8>, r: &Response<'_>) -> Result<(), Error> {
+        buf.clear();
+        self.encode_response(buf, r);
+        self.socket.write_all(buf).await?;
+        self.socket.flush().await?;
+        Ok(())
+    }
+
+    /// Turn this handshake into a [`Connection`].
+    ///
+    /// If `take_over_extensions` is true, the extensions from this
+    /// handshake will be set on the `Connection` returned.
+    pub fn into_connection(mut self, take_over_extensions: bool) -> Connection<T> {
+        let mut c = Connection::new(self.socket, Mode::Server);
+        if take_over_extensions {
+            c.add_extensions(self.extensions.drain());
+        }
+        c
+    }
+
     // Decode client handshake request.
-    pub fn decode_request<'b>(&mut self, bytes: &'b [u8]) -> Result<Parsing<ClientRequest<'b>>, Error> {
+    fn decode_request<'b>(&mut self, buf: &'b [u8]) -> Result<Parsing<ClientRequest<'b>>, Error> {
         let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
         let mut request = httparse::Request::new(&mut header_buf);
 
-        let offset = match request.parse(bytes) {
+        let offset = match request.parse(buf) {
             Ok(httparse::Status::Complete(off)) => off,
             Ok(httparse::Status::Partial) => return Ok(Parsing::NeedMore(())),
             Err(e) => return Err(Error::Http(Box::new(e)))
@@ -109,39 +175,38 @@ impl<'a> Server<'a> {
     }
 
     // Encode server handshake response.
-    pub fn encode_response(&mut self, response: &Response, bytes: &mut Vec<u8>) {
+    fn encode_response(&mut self, buf: &mut Vec<u8>, response: &Response) {
         match response {
             Response::Accept(accept) => {
-                let mut buffer = [0; 32];
+                let mut key_buf = [0; 32];
                 let accept_value = {
                     let mut digest = Sha1::new();
                     digest.update(&accept.key);
                     digest.update(KEY);
                     let d = digest.digest().bytes();
-                    let n = base64::encode_config_slice(&d, base64::STANDARD, &mut buffer);
-                    &buffer[.. n]
+                    let n = base64::encode_config_slice(&d, base64::STANDARD, &mut key_buf);
+                    &key_buf[.. n]
                 };
-                bytes.extend_from_slice(b"HTTP/1.1 101 Switching Protocols");
-                bytes.extend_from_slice(b"\r\nServer: soketto-");
-                bytes.extend_from_slice(SOKETTO_VERSION.as_bytes());
-                bytes.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: upgrade");
-                bytes.extend_from_slice(b"\r\nSec-WebSocket-Accept: ");
-                bytes.extend_from_slice(accept_value);
+                buf.extend_from_slice(b"HTTP/1.1 101 Switching Protocols");
+                buf.extend_from_slice(b"\r\nServer: soketto-");
+                buf.extend_from_slice(SOKETTO_VERSION.as_bytes());
+                buf.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: upgrade");
+                buf.extend_from_slice(b"\r\nSec-WebSocket-Accept: ");
+                buf.extend_from_slice(accept_value);
                 if let Some(p) = accept.protocol {
-                    bytes.extend_from_slice(b"\r\nSec-WebSocket-Protocol: ");
-                    bytes.extend_from_slice(p.as_bytes())
+                    buf.extend_from_slice(b"\r\nSec-WebSocket-Protocol: ");
+                    buf.extend_from_slice(p.as_bytes())
                 }
-                append_extensions(self.extensions.iter().filter(|e| e.is_enabled()), bytes);
-                bytes.extend_from_slice(b"\r\n\r\n")
+                append_extensions(self.extensions.iter().filter(|e| e.is_enabled()), buf);
+                buf.extend_from_slice(b"\r\n\r\n")
             }
-            Response::Reject(reject) => {
-                bytes.extend_from_slice(b"HTTP/1.1 ");
-                let s = StatusCode::from_u16(reject.code)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                bytes.extend_from_slice(s.as_str().as_bytes());
-                bytes.extend_from_slice(b" ");
-                bytes.extend_from_slice(s.canonical_reason().unwrap_or("N/A").as_bytes());
-                bytes.extend_from_slice(b"\r\n\r\n")
+            Response::Reject(rej) => {
+                buf.extend_from_slice(b"HTTP/1.1 ");
+                let s = StatusCode::from_u16(rej.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                buf.extend_from_slice(s.as_str().as_bytes());
+                buf.extend_from_slice(b" ");
+                buf.extend_from_slice(s.canonical_reason().unwrap_or("N/A").as_bytes());
+                buf.extend_from_slice(b"\r\n\r\n")
             }
         }
     }
