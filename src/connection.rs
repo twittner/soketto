@@ -8,6 +8,7 @@
 
 //! A persistent websocket connection after the handshake phase.
 
+use bytes::BytesMut;
 use crate::{Parsing, base::{self, Header, OpCode}, extension::Extension};
 use log::{debug, trace};
 use futures::prelude::*;
@@ -44,7 +45,7 @@ pub struct Connection<T> {
     socket: T,
     codec: base::Codec,
     extensions: SmallVec<[Box<dyn Extension + Send>; 4]>,
-    control_buffer: Vec<u8>, // buffer for interleaved control frames
+    control_buffer: BytesMut, // buffer for interleaved control frames
     max_buffer_size: usize,
     validate_utf8: bool,
     is_closed: bool
@@ -58,7 +59,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             socket,
             codec: base::Codec::default(),
             extensions: SmallVec::new(),
-            control_buffer: Vec::with_capacity(125),
+            control_buffer: BytesMut::with_capacity(125),
             max_buffer_size: 256 * 1024 * 1024,
             validate_utf8: false,
             is_closed: false
@@ -95,14 +96,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     }
 
     /// Send some binary data over this connection.
-    pub async fn send_binary(&mut self, data: &mut Vec<u8>) -> Result<(), Error> {
+    pub async fn send_binary(&mut self, data: &mut BytesMut) -> Result<(), Error> {
         let mut header = Header::new(OpCode::Binary);
         self.send(&mut header, data).await?;
         Ok(())
     }
 
     /// Send some text data over this connection.
-    pub async fn send_text(&mut self, data: &mut Vec<u8>) -> Result<(), Error> {
+    pub async fn send_text(&mut self, data: &mut BytesMut) -> Result<(), Error> {
         debug_assert!(std::str::from_utf8(&data).is_ok());
         let mut header = Header::new(OpCode::Text);
         self.send(&mut header, data).await?;
@@ -110,7 +111,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     }
 
     /// Send arbitrary websocket frames.
-    async fn send(&mut self, header: &mut Header, data: &mut Vec<u8>) -> Result<(), Error> {
+    async fn send(&mut self, header: &mut Header, data: &mut BytesMut) -> Result<(), Error> {
         if self.is_closed {
             debug!("can not send, connection is closed");
             return Err(Error::Closed)
@@ -129,7 +130,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// The `bool` indicates if the data is textual (when `true`) or binary
     /// (when `false`). If `Connection::validate_utf8` is `true` and the
     /// return value is `Ok(true)`, `data` will be valid UTF-8.
-    pub async fn receive(&mut self, data: &mut Vec<u8>) -> Result<bool, Error> {
+    pub async fn receive(&mut self, data: &mut BytesMut) -> Result<bool, Error> {
         let mut off = 0;
         let mut code = None;
         loop {

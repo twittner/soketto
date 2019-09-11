@@ -10,6 +10,7 @@
 //!
 //! [handshake]: https://tools.ietf.org/html/rfc6455#section-4
 
+use bytes::BytesMut;
 use crate::{Parsing, connection::{Connection, Mode}, extension::Extension};
 use futures::prelude::*;
 use http::StatusCode;
@@ -69,7 +70,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     /// Await an incoming client handshake request.
-    pub async fn receive_request<'b>(&mut self, buf: &'b mut Vec<u8>) -> Result<ClientRequest<'b>, Error> {
+    pub async fn receive_request<'b>(&mut self, buf: &'b mut BytesMut) -> Result<ClientRequest<'b>, Error> {
         buf.clear();
         let mut offset = 0;
         loop {
@@ -107,7 +108,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     /// Respond to the client.
-    pub async fn send_response(&mut self, buf: &mut Vec<u8>, r: &Response<'_>) -> Result<(), Error> {
+    pub async fn send_response(&mut self, buf: &mut BytesMut, r: &Response<'_>) -> Result<(), Error> {
         buf.clear();
         self.encode_response(buf, r);
         self.socket.write_all(buf).await?;
@@ -175,7 +176,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     // Encode server handshake response.
-    fn encode_response(&mut self, buf: &mut Vec<u8>, response: &Response) {
+    fn encode_response(&mut self, buf: &mut BytesMut, response: &Response) {
         match response {
             Response::Accept(accept) => {
                 let mut key_buf = [0; 32];

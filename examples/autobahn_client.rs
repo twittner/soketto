@@ -16,6 +16,7 @@
 
 use assert_matches::assert_matches;
 use async_std::{net::TcpStream, task};
+use bytes::BytesMut;
 use soketto::{BoxedError, handshake};
 use std::str::FromStr;
 
@@ -36,7 +37,7 @@ fn main() -> Result<(), BoxedError> {
     })
 }
 
-async fn num_of_cases(buf: &mut Vec<u8>) -> Result<usize, BoxedError> {
+async fn num_of_cases(buf: &mut BytesMut) -> Result<usize, BoxedError> {
     let s = TcpStream::connect("127.0.0.1:9001").await?;
     let mut c = new_client(s, "/getCaseCount");
     assert_matches!(c.handshake(buf).await?, handshake::ServerResponse::Accepted(_));
@@ -45,7 +46,7 @@ async fn num_of_cases(buf: &mut Vec<u8>) -> Result<usize, BoxedError> {
     Ok(usize::from_str(std::str::from_utf8(buf)?)?)
 }
 
-async fn run_case(n: usize, buf: &mut Vec<u8>) -> Result<(), BoxedError> {
+async fn run_case(n: usize, buf: &mut BytesMut) -> Result<(), BoxedError> {
     let resource = format!("/runCase?case={}&agent=soketto-{}", n, SOKETTO_VERSION);
     let s = TcpStream::connect("127.0.0.1:9001").await?;
     let mut c = new_client(s, &resource);
@@ -67,7 +68,7 @@ async fn run_case(n: usize, buf: &mut Vec<u8>) -> Result<(), BoxedError> {
     Ok(())
 }
 
-async fn update_report(buf: &mut Vec<u8>) -> Result<(), BoxedError> {
+async fn update_report(buf: &mut BytesMut) -> Result<(), BoxedError> {
     let resource = format!("/updateReports?agent=soketto-{}", SOKETTO_VERSION);
     let s = TcpStream::connect("127.0.0.1:9001").await?;
     let mut c = new_client(s, &resource);

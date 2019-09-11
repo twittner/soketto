@@ -17,6 +17,7 @@ deflate = ["flate2"]
 
 [dependencies]
 base64 = "0.10.1"
+bytes = "0.4.12"
 flate2 = { version = "1.0.8", features = ["zlib"], default-features = false, optional = true }
 futures-preview = "0.3.0-alpha.18"
 http = "0.1.17"

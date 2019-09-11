@@ -10,6 +10,7 @@
 //!
 //! [handshake]: https://tools.ietf.org/html/rfc6455#section-4
 
+use bytes::BytesMut;
 use crate::{Parsing, connection::{Connection, Mode}, extension::Extension};
 use futures::prelude::*;
 use sha1::Sha1;
@@ -89,7 +90,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
     }
 
     /// Initiate client handshake request to server and get back the response.
-    pub async fn handshake<'b>(&mut self, buf: &'b mut Vec<u8>) -> Result<ServerResponse<'b>, Error> {
+    pub async fn handshake(&mut self, buf: &mut BytesMut) -> Result<ServerResponse, Error> {
         buf.clear();
         self.encode_request(buf);
         self.socket.write_all(buf).await?;
@@ -98,34 +99,12 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
         buf.clear();
         let mut offset = 0;
         loop {
-            // Here is what we would like to write:
-            //
-            //   if buf.len() == offset {
-            //       buf.resize(offset + BLOCK_SIZE, 0)
-            //   }
-            //   offset += self.socket.read(&mut buf[offset ..]).await?;
-            //   if let Parsing::Done { value, .. } = self.decode_response(&buf[.. offset])? {
-            //       return Ok(value)
-            //   }
-            //
-            // But because `&buf[.. offset]` has lifetime 'b (it backs the
-            // `ServerResponse<'b>`), the borrow checker will not allow us
-            // to `resize` `buf` because it means a second mutable borrow
-            // during the lifetime of 'b (on the next loop iteration).
-            // Note that this is safe because we will only modify `buf` if
-            // we do not return a borrow.
             if buf.len() == offset {
                 buf.resize(offset + BLOCK_SIZE, 0)
             }
-            let buf_slice = {
-                let p = buf.as_mut_ptr();
-                let n = buf.len();
-                unsafe { // NOTE
-                    std::slice::from_raw_parts_mut(p, n)
-                }
-            };
-            offset += self.socket.read(&mut buf_slice[offset ..]).await?;
-            if let Parsing::Done { value, .. } = self.decode_response(&buf_slice[.. offset])? {
+            offset += self.socket.read(&mut buf[offset ..]).await?;
+            if let Parsing::Done { value, offset } = self.decode_response(buf)? {
+                buf.split_to(offset);
                 return Ok(value)
             }
         }
@@ -144,7 +123,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
     }
 
     /// Encode the client handshake as a request, ready to be sent to the server.
-    fn encode_request(&mut self, buf: &mut Vec<u8>) {
+    fn encode_request(&mut self, buf: &mut BytesMut) {
         let nonce: [u8; 16] = rand::random();
         self.nonce_offset = base64::encode_config_slice(&nonce, base64::STANDARD, &mut self.nonce);
         buf.extend_from_slice(b"GET ");
@@ -172,7 +151,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
     }
 
     /// Decode the server response to this client request.
-    fn decode_response<'b>(&mut self, buf: &'b [u8]) -> Result<Parsing<ServerResponse<'b>>, Error> {
+    fn decode_response(&mut self, buf: &mut BytesMut) -> Result<Parsing<ServerResponse>, Error> {
         let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
         let mut response = httparse::Response::new(&mut header_buf);
 
@@ -190,12 +169,14 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
             Some(101) => (),
             Some(code@(301 ..= 303)) | Some(code@307) | Some(code@308) => { // redirect response
                 let location = with_first_header(response.headers, "Location", |loc| {
-                    Ok(std::str::from_utf8(loc)?)
+                    Ok(String::from(std::str::from_utf8(loc)?))
                 })?;
+                buf.split_to(offset); // chop off the HTTP part we have processed
                 let response = Redirect { status_code: code, location };
                 return Ok(Parsing::Done { value: ServerResponse::Redirect(response), offset })
             }
             other => {
+                buf.split_to(offset); // chop off the HTTP part we have processed
                 let response = Rejected { code: other.unwrap_or(0) };
                 return Ok(Parsing::Done { value: ServerResponse::Rejected(response), offset })
             }
@@ -230,40 +211,46 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
         if let Some(tp) = response.headers.iter()
             .find(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_PROTOCOL))
         {
-            if self.protocols.iter().find(|x| x.as_bytes() == tp.value).is_some() {
-                selected_proto = Some(std::str::from_utf8(tp.value)?)
+            if let Some(&p) = self.protocols.iter().find(|x| x.as_bytes() == tp.value) {
+                selected_proto = Some(String::from(p))
             } else {
                 return Err(Error::UnsolicitedProtocol)
             }
         }
 
+        buf.split_to(offset); // chop off the HTTP part we have processed
+
         let response = Accepted { protocol: selected_proto };
-        Ok(Parsing::Done { value: ServerResponse::Accepted(response), offset })
+        Ok(Parsing::Done { value: ServerResponse::Accepted(response), offset: 0 })
     }
 }
 
 /// Handshake response received from the server.
 #[derive(Debug)]
-pub enum ServerResponse<'a> {
+pub enum ServerResponse {
     /// The server has accepted our request.
-    Accepted(Accepted<'a>),
+    Accepted(Accepted),
     /// The server is redirecting us to some other location.
-    Redirect(Redirect<'a>),
+    Redirect(Redirect),
     /// The server rejected our request.
     Rejected(Rejected)
 }
 
 /// The server accepted the handshake request.
 #[derive(Debug)]
-pub struct Accepted<'a> {
+pub struct Accepted {
     /// The protocol (if any) the server has selected.
-    protocol: Option<&'a str>
+    protocol: Option<String>
 }
 
-impl<'a> Accepted<'a> {
+impl Accepted {
     /// The protocol the server has selected from the proposed ones.
     pub fn protocol(&self) -> Option<&str> {
-        self.protocol.clone()
+        self.protocol.as_ref().map(|s| &**s)
+    }
+
+    pub fn into_protocol(self) -> Option<String> {
+        self.protocol
     }
 }
 
@@ -283,20 +270,20 @@ impl Rejected {
 
 /// The server is redirecting us to another location.
 #[derive(Debug)]
-pub struct Redirect<'a> {
+pub struct Redirect {
     /// The HTTP response status code.
     status_code: u16,
     /// The location URL we should go to.
-    location: &'a str
+    location: String
 }
 
-impl<'a> fmt::Display for Redirect<'a> {
+impl fmt::Display for Redirect {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "redirect: code = {}, location = \"{}\"", self.status_code, self.location)
     }
 }
 
-impl<'a> Redirect<'a> {
+impl Redirect {
     /// The HTTP response status code.
     pub fn status_code(&self) -> u16 {
         self.status_code
@@ -304,6 +291,10 @@ impl<'a> Redirect<'a> {
 
     /// The HTTP response location header.
     pub fn location(&self) -> &str {
+        &self.location
+    }
+
+    pub fn into_location(self) -> String {
         self.location
     }
 }

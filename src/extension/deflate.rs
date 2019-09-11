@@ -10,6 +10,7 @@
 //!
 //! [rfc7692]: https://tools.ietf.org/html/rfc7692
 
+use bytes::BytesMut;
 use crate::{
     BoxedError,
     base::{Header, OpCode},
@@ -219,7 +220,7 @@ impl Extension for Deflate {
         (true, false, false)
     }
 
-    fn decode(&mut self, header: &mut Header, data: &mut Vec<u8>) -> Result<(), BoxedError> {
+    fn decode(&mut self, header: &mut Header, data: &mut BytesMut) -> Result<(), BoxedError> {
         match header.opcode() {
             OpCode::Binary | OpCode::Text if header.is_rsv1() && header.is_fin() => {}
             OpCode::Continue if header.is_fin() => {}
@@ -242,7 +243,7 @@ impl Extension for Deflate {
         Ok(())
     }
 
-    fn encode(&mut self, header: &mut Header, data: &mut Vec<u8>) -> Result<(), BoxedError> {
+    fn encode(&mut self, header: &mut Header, data: &mut BytesMut) -> Result<(), BoxedError> {
         if let OpCode::Text | OpCode::Binary = header.opcode() {
             // ok; continue
         } else {
