@@ -8,12 +8,15 @@
 
 //! A persistent websocket connection after the handshake phase.
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use crate::{Parsing, base::{self, Header, OpCode}, extension::Extension};
 use log::{debug, trace};
 use futures::prelude::*;
 use smallvec::SmallVec;
+use static_assertions::const_assert;
 use std::{fmt, io};
+
+const BLOCK_SIZE: usize = 4096;
 
 /// Is the [`Connection`] used by a client or server?
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -45,7 +48,6 @@ pub struct Connection<T> {
     socket: T,
     codec: base::Codec,
     extensions: SmallVec<[Box<dyn Extension + Send>; 4]>,
-    control_buffer: BytesMut, // buffer for interleaved control frames
     max_buffer_size: usize,
     validate_utf8: bool,
     is_closed: bool
@@ -59,7 +61,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             socket,
             codec: base::Codec::default(),
             extensions: SmallVec::new(),
-            control_buffer: BytesMut::with_capacity(125),
             max_buffer_size: 256 * 1024 * 1024,
             validate_utf8: false,
             is_closed: false
@@ -120,7 +121,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             trace!("encoding with extension: {}", e.name());
             e.encode(header, data).map_err(Error::Extension)?
         }
-        write(self.mode, &mut self.codec, &mut self.socket, header, data.as_mut(), false).await?;
+        write(self.mode, &mut self.codec, &mut self.socket, header, data, false).await?;
         Ok(())
     }
 
@@ -130,38 +131,55 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// The `bool` indicates if the data is textual (when `true`) or binary
     /// (when `false`). If `Connection::validate_utf8` is `true` and the
     /// return value is `Ok(true)`, `data` will be valid UTF-8.
-    pub async fn receive(&mut self, data: &mut BytesMut) -> Result<bool, Error> {
-        let mut off = 0;
+    pub async fn receive(&mut self, data: &mut BytesMut) -> Result<(BytesMut, bool), Error> {
         let mut code = None;
+        let mut offset = 0;
         loop {
             if self.is_closed {
                 debug!("can not receive, connection is closed");
                 return Err(Error::Closed)
             }
 
-            let mut header = self.receive_header().await?;
-            trace!("read: {:?}", header);
+            let mut header = self.receive_header(data).await?;
+            trace!("recv: {:?}", header);
 
-            let n = header.payload_len();
-
+            // Handle control frames.
             if header.opcode().is_control() {
-                debug_assert!(n < 126); // ensured by `base::Codec`
-                self.socket.read_exact(&mut self.control_buffer[.. n]).await?;
-                self.on_control(&header).await?;
+                debug_assert!(header.payload_len() < 126); // ensured by `base::Codec`
+                if data.len() < header.payload_len() {
+                    const_assert!(min_block_size; BLOCK_SIZE > 125);
+                    data.reserve(BLOCK_SIZE)
+                }
+                while data.len() < header.payload_len() {
+                    unsafe {
+                        let n = self.socket.read(data.bytes_mut()).await?;
+                        data.advance_mut(n)
+                    }
+                }
+                self.on_control(&header, data).await?;
+                let mut continuation = data.split_off(offset);
+                continuation.split_to(header.payload_len());
+                data.unsplit(continuation);
                 continue
             }
 
-            if off + n > self.max_buffer_size {
+            if data.len() + header.payload_len() > self.max_buffer_size {
                 return Err(Error::MessageTooLarge {
-                    current: off + n,
+                    current: data.len() + header.payload_len(),
                     maximum: self.max_buffer_size
                 })
             }
 
-            data.resize(off + n, 0);
-            self.socket.read_exact(&mut data[off .. off + n]).await?;
-            self.codec.apply_mask(&header, &mut data[off .. off + n]);
-            off += n;
+            while data.len() < header.payload_len() {
+                data.reserve(std::cmp::max(BLOCK_SIZE, header.payload_len()));
+                unsafe {
+                    let n = self.socket.read(data.bytes_mut()).await?;
+                    data.advance_mut(n)
+                }
+            }
+
+            self.codec.apply_mask(&header, &mut data[offset .. header.payload_len()]);
+            offset += header.payload_len();
 
             if !header.is_fin() {
                 if header.opcode() != OpCode::Continue { // first fragment
@@ -183,46 +201,47 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                     // We do this so that extensions only operate on
                     // non-fragmented messages.
                     header.set_opcode(c);
-                    debug_assert_eq!(off, data.len());
-                    header.set_payload_len(data.len());
+                    header.set_payload_len(offset);
                 } else {
                     // Malformed fragment
                     return Err(Error::UnexpectedOpCode(header.opcode()))
                 }
             }
 
+            let mut payload = data.split_to(offset);
+
             for e in &mut self.extensions {
                 trace!("decoding with extension: {}", e.name());
-                e.decode(&mut header, data).map_err(Error::Extension)?
+                e.decode(&mut header, &mut payload).map_err(Error::Extension)?
             }
 
             let is_text = header.opcode() == OpCode::Text;
 
             if is_text && self.validate_utf8 {
-                std::str::from_utf8(data)?;
+                std::str::from_utf8(&payload)?;
             }
 
-            return Ok(is_text)
+            return Ok((payload, is_text))
         }
     }
 
     /// Answer incoming control frames.
-    async fn on_control(&mut self, header: &Header) -> Result<(), Error> {
+    async fn on_control(&mut self, header: &Header, data: &mut BytesMut) -> Result<(), Error> {
+        debug_assert!(data.len() >= header.payload_len());
         match header.opcode() {
             OpCode::Ping => {
                 let mut answer = Header::new(OpCode::Pong);
-                let data = &mut self.control_buffer[.. header.payload_len()];
                 let codec = &mut self.codec;
                 let sockt = &mut self.socket;
-                write(self.mode, codec, sockt, &mut answer, data, true).await?;
+                let payload = &mut data[.. header.payload_len()];
+                write(self.mode, codec, sockt, &mut answer, payload, true).await?;
                 Ok(())
             }
             OpCode::Pong => Ok(()),
             OpCode::Close => {
-                let payload = &self.control_buffer[.. header.payload_len()];
                 let codec = &mut self.codec;
                 let sockt = &mut self.socket;
-                let (mut header, code) = close_answer(payload)?;
+                let (mut header, code) = close_answer(&data[.. header.payload_len()])?;
                 if let Some(c) = code {
                     let mut data = c.to_be_bytes();
                     write(self.mode, codec, sockt, &mut header, &mut data[..], true).await?
@@ -249,16 +268,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     }
 
     /// Read the next frame header from the socket.
-    async fn receive_header(&mut self) -> Result<Header, Error> {
-        let mut buf = [0; 14];
-        let mut off = 0;
+    async fn receive_header(&mut self, data: &mut BytesMut) -> Result<Header, Error> {
         loop {
-            match self.codec.decode_header(&buf[.. off])? {
-                Parsing::Done { value: header, .. } => return Ok(header),
-                Parsing::NeedMore(n) => {
-                    debug_assert!(n > 0 && off + n < 16);
-                    self.socket.read_exact(&mut buf[off .. off + n]).await?;
-                    off += n
+            match self.codec.decode_header(&data)? {
+                Parsing::Done { value: header, offset } => {
+                    data.split_to(offset);
+                    return Ok(header)
+                }
+                Parsing::NeedMore(_) => {
+                    if !data.has_remaining_mut() {
+                        data.reserve(BLOCK_SIZE)
+                    }
+                    unsafe {
+                        let n = self.socket.read(data.bytes_mut()).await?;
+                        data.advance_mut(n)
+                    }
                 }
             }
         }
@@ -302,7 +326,7 @@ where
     }
     header.set_payload_len(data.len());
     let header_bytes = codec.encode_header(&header);
-    trace!("write: {:?}", header);
+    trace!("send: {:?}", header);
     socket.write_all(header_bytes).await?;
     if !data.is_empty() {
         socket.write_all(data).await?;

@@ -15,29 +15,26 @@
 // See https://github.com/crossbario/autobahn-testsuite for details.
 
 use async_std::{net::{TcpListener, TcpStream}, prelude::*, task};
+use bytes::BytesMut;
 use soketto::{BoxedError, handshake};
 
 fn main() -> Result<(), BoxedError> {
     env_logger::init();
     task::block_on(async {
-        let mut buf = Vec::new();
+        let mut buf = BytesMut::new();
         let listener = TcpListener::bind("127.0.0.1:9001").await?;
         let mut incoming = listener.incoming();
         while let Some(s) = incoming.next().await {
             let mut s = new_server(s?);
             let key = {
                 let req = s.receive_request(&mut buf).await?;
-                Vec::from(req.key())
+                req.into_key()
             };
-            let accept = {
-                let a = handshake::server::Accept::new(&key);
-                handshake::server::Response::Accept(a)
-            };
+            let accept = handshake::server::Response::Accept { key: &key, protocol: None };
             s.send_response(&mut buf, &accept).await?;
             let mut c = s.into_connection(true);
             c.validate_utf8(true);
             loop {
-                buf.clear();
                 let is_text = c.receive(&mut buf).await?;
                 if buf.is_empty() {
                     break

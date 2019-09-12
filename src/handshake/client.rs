@@ -10,12 +10,12 @@
 //!
 //! [handshake]: https://tools.ietf.org/html/rfc6455#section-4
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use crate::{Parsing, connection::{Connection, Mode}, extension::Extension};
 use futures::prelude::*;
 use sha1::Sha1;
 use smallvec::SmallVec;
-use std::{fmt, str};
+use std::str;
 use super::{
     Error,
     KEY,
@@ -95,14 +95,16 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
         self.encode_request(buf);
         self.socket.write_all(buf).await?;
         self.socket.flush().await?;
-
         buf.clear();
-        let mut offset = 0;
+
         loop {
-            if buf.len() == offset {
-                buf.resize(offset + BLOCK_SIZE, 0)
+            if !buf.has_remaining_mut() {
+                buf.reserve(BLOCK_SIZE)
             }
-            offset += self.socket.read(&mut buf[offset ..]).await?;
+            unsafe {
+                let n = self.socket.read(buf.bytes_mut()).await?;
+                buf.advance_mut(n)
+            }
             if let Parsing::Done { value, offset } = self.decode_response(buf)? {
                 buf.split_to(offset);
                 return Ok(value)
@@ -151,7 +153,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
     }
 
     /// Decode the server response to this client request.
-    fn decode_response(&mut self, buf: &mut BytesMut) -> Result<Parsing<ServerResponse>, Error> {
+    fn decode_response(&mut self, buf: &[u8]) -> Result<Parsing<ServerResponse>, Error> {
         let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
         let mut response = httparse::Response::new(&mut header_buf);
 
@@ -171,14 +173,12 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
                 let location = with_first_header(response.headers, "Location", |loc| {
                     Ok(String::from(std::str::from_utf8(loc)?))
                 })?;
-                buf.split_to(offset); // chop off the HTTP part we have processed
-                let response = Redirect { status_code: code, location };
-                return Ok(Parsing::Done { value: ServerResponse::Redirect(response), offset })
+                let response = ServerResponse::Redirect { status_code: code, location };
+                return Ok(Parsing::Done { value: response, offset })
             }
             other => {
-                buf.split_to(offset); // chop off the HTTP part we have processed
-                let response = Rejected { code: other.unwrap_or(0) };
-                return Ok(Parsing::Done { value: ServerResponse::Rejected(response), offset })
+                let response = ServerResponse::Rejected { status_code: other.unwrap_or(0) };
+                return Ok(Parsing::Done { value: response, offset })
             }
         }
 
@@ -218,10 +218,8 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
             }
         }
 
-        buf.split_to(offset); // chop off the HTTP part we have processed
-
-        let response = Accepted { protocol: selected_proto };
-        Ok(Parsing::Done { value: ServerResponse::Accepted(response), offset: 0 })
+        let response = ServerResponse::Accepted { protocol: selected_proto };
+        Ok(Parsing::Done { value: response, offset })
     }
 }
 
@@ -229,73 +227,21 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
 #[derive(Debug)]
 pub enum ServerResponse {
     /// The server has accepted our request.
-    Accepted(Accepted),
+    Accepted {
+        /// The protocol (if any) the server has selected.
+        protocol: Option<String>
+    },
     /// The server is redirecting us to some other location.
-    Redirect(Redirect),
+    Redirect {
+        /// The HTTP response status code.
+        status_code: u16,
+        /// The location URL we should go to.
+        location: String
+    },
     /// The server rejected our request.
-    Rejected(Rejected)
-}
-
-/// The server accepted the handshake request.
-#[derive(Debug)]
-pub struct Accepted {
-    /// The protocol (if any) the server has selected.
-    protocol: Option<String>
-}
-
-impl Accepted {
-    /// The protocol the server has selected from the proposed ones.
-    pub fn protocol(&self) -> Option<&str> {
-        self.protocol.as_ref().map(|s| &**s)
-    }
-
-    pub fn into_protocol(self) -> Option<String> {
-        self.protocol
-    }
-}
-
-/// Error handshake response received from the server.
-#[derive(Debug)]
-pub struct Rejected {
-    /// HTTP response status code.
-    code: u16
-}
-
-impl Rejected {
-    /// The response code from the server.
-    pub fn code(&self) -> u16 {
-        self.code
-    }
-}
-
-/// The server is redirecting us to another location.
-#[derive(Debug)]
-pub struct Redirect {
-    /// The HTTP response status code.
-    status_code: u16,
-    /// The location URL we should go to.
-    location: String
-}
-
-impl fmt::Display for Redirect {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "redirect: code = {}, location = \"{}\"", self.status_code, self.location)
-    }
-}
-
-impl Redirect {
-    /// The HTTP response status code.
-    pub fn status_code(&self) -> u16 {
-        self.status_code
-    }
-
-    /// The HTTP response location header.
-    pub fn location(&self) -> &str {
-        &self.location
-    }
-
-    pub fn into_location(self) -> String {
-        self.location
+    Rejected {
+        /// HTTP response status code.
+        status_code: u16
     }
 }
 

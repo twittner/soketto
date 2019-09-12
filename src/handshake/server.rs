@@ -10,7 +10,7 @@
 //!
 //! [handshake]: https://tools.ietf.org/html/rfc6455#section-4
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use crate::{Parsing, connection::{Connection, Mode}, extension::Extension};
 use futures::prelude::*;
 use http::StatusCode;
@@ -70,38 +70,18 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     /// Await an incoming client handshake request.
-    pub async fn receive_request<'b>(&mut self, buf: &'b mut BytesMut) -> Result<ClientRequest<'b>, Error> {
+    pub async fn receive_request(&mut self, buf: &mut BytesMut) -> Result<ClientRequest<'a>, Error> {
         buf.clear();
-        let mut offset = 0;
         loop {
-            // Here is what we would like to write:
-            //
-            //   if buf.len() == offset {
-            //       buf.resize(offset + BLOCK_SIZE, 0)
-            //   }
-            //   offset += self.socket.read(&mut buf[offset ..]).await?;
-            //   if let Parsing::Done { value, .. } = self.decode_request(&buf[.. offset])? {
-            //       return Ok(value)
-            //   }
-            //
-            // But because `&buf[.. offset]` has lifetime 'b (it backs the
-            // `ClientRequest<'b>`), the borrow checker will not allow us
-            // to `resize` `buf` because it means a second mutable borrow
-            // during the lifetime of 'b (on the next loop iteration).
-            // Note that this is safe because we will only modify `buf` if
-            // we do not return a borrow.
-            if buf.len() == offset {
-                buf.resize(offset + BLOCK_SIZE, 0)
+            if !buf.has_remaining_mut() {
+                buf.reserve(BLOCK_SIZE)
             }
-            let buf_slice = {
-                let p = buf.as_mut_ptr();
-                let n = buf.len();
-                unsafe { // NOTE
-                    std::slice::from_raw_parts_mut(p, n)
-                }
-            };
-            offset += self.socket.read(&mut buf_slice[offset ..]).await?;
-            if let Parsing::Done { value, .. } = self.decode_request(&buf_slice[.. offset])? {
+            unsafe {
+                let n = self.socket.read(buf.bytes_mut()).await?;
+                buf.advance_mut(n)
+            }
+            if let Parsing::Done { value, offset } = self.decode_request(buf)? {
+                buf.split_to(offset);
                 return Ok(value)
             }
         }
@@ -129,7 +109,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     // Decode client handshake request.
-    fn decode_request<'b>(&mut self, buf: &'b [u8]) -> Result<Parsing<ClientRequest<'b>>, Error> {
+    fn decode_request(&mut self, buf: &[u8]) -> Result<Parsing<ClientRequest<'a>>, Error> {
         let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
         let mut request = httparse::Request::new(&mut header_buf);
 
@@ -154,7 +134,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
         expect_ascii_header(request.headers, "Sec-WebSocket-Version", "13")?;
 
         let ws_key = with_first_header(&request.headers, "Sec-WebSocket-Key", |k| {
-            Ok(k)
+            Ok(Vec::from(k))
         })?;
 
         for h in request.headers.iter()
@@ -167,8 +147,8 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
         for p in request.headers.iter()
             .filter(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_PROTOCOL))
         {
-            if self.protocols.iter().find(|x| x.as_bytes() == p.value).is_some() {
-                protocols.push(std::str::from_utf8(p.value)?)
+            if let Some(&p) = self.protocols.iter().find(|x| x.as_bytes() == p.value) {
+                protocols.push(p)
             }
         }
 
@@ -176,13 +156,13 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     // Encode server handshake response.
-    fn encode_response(&mut self, buf: &mut BytesMut, response: &Response) {
+    fn encode_response(&mut self, buf: &mut BytesMut, response: &Response<'_>) {
         match response {
-            Response::Accept(accept) => {
+            Response::Accept { key, protocol } => {
                 let mut key_buf = [0; 32];
                 let accept_value = {
                     let mut digest = Sha1::new();
-                    digest.update(&accept.key);
+                    digest.update(key);
                     digest.update(KEY);
                     let d = digest.digest().bytes();
                     let n = base64::encode_config_slice(&d, base64::STANDARD, &mut key_buf);
@@ -194,16 +174,17 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
                 buf.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: upgrade");
                 buf.extend_from_slice(b"\r\nSec-WebSocket-Accept: ");
                 buf.extend_from_slice(accept_value);
-                if let Some(p) = accept.protocol {
+                if let Some(p) = protocol {
                     buf.extend_from_slice(b"\r\nSec-WebSocket-Protocol: ");
                     buf.extend_from_slice(p.as_bytes())
                 }
                 append_extensions(self.extensions.iter().filter(|e| e.is_enabled()), buf);
                 buf.extend_from_slice(b"\r\n\r\n")
             }
-            Response::Reject(rej) => {
+            Response::Reject { status_code } => {
                 buf.extend_from_slice(b"HTTP/1.1 ");
-                let s = StatusCode::from_u16(rej.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let s = StatusCode::from_u16(*status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 buf.extend_from_slice(s.as_str().as_bytes());
                 buf.extend_from_slice(b" ");
                 buf.extend_from_slice(s.canonical_reason().unwrap_or("N/A").as_bytes());
@@ -216,13 +197,17 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
 /// Handshake request received from the client.
 #[derive(Debug)]
 pub struct ClientRequest<'a> {
-    ws_key: &'a [u8],
+    ws_key: Vec<u8>,
     protocols: SmallVec<[&'a str; 4]>
 }
 
 impl<'a> ClientRequest<'a> {
     /// A reference to the nonce.
     pub fn key(&self) -> &[u8] {
+        &self.ws_key
+    }
+
+    pub fn into_key(self) -> Vec<u8> {
         self.ws_key
     }
 
@@ -236,49 +221,13 @@ impl<'a> ClientRequest<'a> {
 #[derive(Debug)]
 pub enum Response<'a> {
     /// The server accepts the handshake request.
-    Accept(Accept<'a>),
+    Accept {
+        key: &'a [u8],
+        protocol: Option<&'a str>
+    },
     /// The server rejects the handshake request.
-    Reject(Reject)
-}
-
-/// Successful handshake response the server wants to send to the client.
-#[derive(Debug)]
-pub struct Accept<'a> {
-    key: &'a [u8],
-    protocol: Option<&'a str>
-}
-
-impl<'a> Accept<'a> {
-    /// Create a new accept response.
-    ///
-    /// The `key` corresponds to the websocket key (nonce) the client has
-    /// sent in its handshake request.
-    pub fn new(key: &'a [u8]) -> Self {
-        Accept {
-            key: key,
-            protocol: None
-        }
-    }
-
-    /// Set the protocol the server selected from the proposed ones.
-    pub fn set_protocol(&mut self, p: &'a str) -> &mut Self {
-        self.protocol = Some(p);
-        self
+    Reject {
+        status_code: u16
     }
 }
-
-/// Error handshake response the server wants to send to the client.
-#[derive(Debug)]
-pub struct Reject {
-    /// HTTP response status code.
-    code: u16
-}
-
-impl Reject {
-    /// Create a new reject response with the given HTTP status code.
-    pub fn new(code: u16) -> Self {
-        Reject { code }
-    }
-}
-
 
