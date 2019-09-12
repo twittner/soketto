@@ -39,7 +39,9 @@ pub struct Server<'a, T> {
     /// Protocols the server supports.
     protocols: SmallVec<[&'a str; 4]>,
     /// Extensions the server supports.
-    extensions: SmallVec<[Box<dyn Extension + Send>; 4]>
+    extensions: SmallVec<[Box<dyn Extension + Send>; 4]>,
+    /// Encoding/decoding buffer
+    buffer: BytesMut
 }
 
 impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
@@ -48,8 +50,14 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
         Server {
             socket,
             protocols: SmallVec::new(),
-            extensions: SmallVec::new()
+            extensions: SmallVec::new(),
+            buffer: BytesMut::new()
         }
+    }
+
+    pub fn set_buffer(&mut self, b: BytesMut) -> &mut Self {
+        self.buffer = b;
+        self
     }
 
     /// Add a protocol the server supports.
@@ -70,28 +78,28 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     /// Await an incoming client handshake request.
-    pub async fn receive_request(&mut self, buf: &mut BytesMut) -> Result<ClientRequest<'a>, Error> {
-        buf.clear();
+    pub async fn receive_request(&mut self) -> Result<ClientRequest<'a>, Error> {
+        self.buffer.clear();
         loop {
-            if !buf.has_remaining_mut() {
-                buf.reserve(BLOCK_SIZE)
+            if !self.buffer.has_remaining_mut() {
+                self.buffer.reserve(BLOCK_SIZE)
             }
             unsafe {
-                let n = self.socket.read(buf.bytes_mut()).await?;
-                buf.advance_mut(n)
+                let n = self.socket.read(self.buffer.bytes_mut()).await?;
+                self.buffer.advance_mut(n)
             }
-            if let Parsing::Done { value, offset } = self.decode_request(buf)? {
-                buf.split_to(offset);
+            if let Parsing::Done { value, offset } = self.decode_request()? {
+                self.buffer.split_to(offset);
                 return Ok(value)
             }
         }
     }
 
     /// Respond to the client.
-    pub async fn send_response(&mut self, buf: &mut BytesMut, r: &Response<'_>) -> Result<(), Error> {
-        buf.clear();
-        self.encode_response(buf, r);
-        self.socket.write_all(buf).await?;
+    pub async fn send_response(&mut self, r: &Response<'_>) -> Result<(), Error> {
+        self.buffer.clear();
+        self.encode_response(r);
+        self.socket.write_all(&self.buffer).await?;
         self.socket.flush().await?;
         Ok(())
     }
@@ -102,6 +110,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     /// handshake will be set on the `Connection` returned.
     pub fn into_connection(mut self, take_over_extensions: bool) -> Connection<T> {
         let mut c = Connection::new(self.socket, Mode::Server);
+        c.set_buffer(self.buffer);
         if take_over_extensions {
             c.add_extensions(self.extensions.drain());
         }
@@ -109,11 +118,11 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     // Decode client handshake request.
-    fn decode_request(&mut self, buf: &[u8]) -> Result<Parsing<ClientRequest<'a>>, Error> {
+    fn decode_request(&mut self) -> Result<Parsing<ClientRequest<'a>>, Error> {
         let mut header_buf = [httparse::EMPTY_HEADER; MAX_NUM_HEADERS];
         let mut request = httparse::Request::new(&mut header_buf);
 
-        let offset = match request.parse(buf) {
+        let offset = match request.parse(&self.buffer) {
             Ok(httparse::Status::Complete(off)) => off,
             Ok(httparse::Status::Partial) => return Ok(Parsing::NeedMore(())),
             Err(e) => return Err(Error::Http(Box::new(e)))
@@ -156,7 +165,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     // Encode server handshake response.
-    fn encode_response(&mut self, buf: &mut BytesMut, response: &Response<'_>) {
+    fn encode_response(&mut self, response: &Response<'_>) {
         match response {
             Response::Accept { key, protocol } => {
                 let mut key_buf = [0; 32];
@@ -168,27 +177,27 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
                     let n = base64::encode_config_slice(&d, base64::STANDARD, &mut key_buf);
                     &key_buf[.. n]
                 };
-                buf.extend_from_slice(b"HTTP/1.1 101 Switching Protocols");
-                buf.extend_from_slice(b"\r\nServer: soketto-");
-                buf.extend_from_slice(SOKETTO_VERSION.as_bytes());
-                buf.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: upgrade");
-                buf.extend_from_slice(b"\r\nSec-WebSocket-Accept: ");
-                buf.extend_from_slice(accept_value);
+                self.buffer.extend_from_slice(b"HTTP/1.1 101 Switching Protocols");
+                self.buffer.extend_from_slice(b"\r\nServer: soketto-");
+                self.buffer.extend_from_slice(SOKETTO_VERSION.as_bytes());
+                self.buffer.extend_from_slice(b"\r\nUpgrade: websocket\r\nConnection: upgrade");
+                self.buffer.extend_from_slice(b"\r\nSec-WebSocket-Accept: ");
+                self.buffer.extend_from_slice(accept_value);
                 if let Some(p) = protocol {
-                    buf.extend_from_slice(b"\r\nSec-WebSocket-Protocol: ");
-                    buf.extend_from_slice(p.as_bytes())
+                    self.buffer.extend_from_slice(b"\r\nSec-WebSocket-Protocol: ");
+                    self.buffer.extend_from_slice(p.as_bytes())
                 }
-                append_extensions(self.extensions.iter().filter(|e| e.is_enabled()), buf);
-                buf.extend_from_slice(b"\r\n\r\n")
+                append_extensions(self.extensions.iter().filter(|e| e.is_enabled()), &mut self.buffer);
+                self.buffer.extend_from_slice(b"\r\n\r\n")
             }
             Response::Reject { status_code } => {
-                buf.extend_from_slice(b"HTTP/1.1 ");
+                self.buffer.extend_from_slice(b"HTTP/1.1 ");
                 let s = StatusCode::from_u16(*status_code)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                buf.extend_from_slice(s.as_str().as_bytes());
-                buf.extend_from_slice(b" ");
-                buf.extend_from_slice(s.canonical_reason().unwrap_or("N/A").as_bytes());
-                buf.extend_from_slice(b"\r\n\r\n")
+                self.buffer.extend_from_slice(s.as_str().as_bytes());
+                self.buffer.extend_from_slice(b" ");
+                self.buffer.extend_from_slice(s.canonical_reason().unwrap_or("N/A").as_bytes());
+                self.buffer.extend_from_slice(b"\r\n\r\n")
             }
         }
     }

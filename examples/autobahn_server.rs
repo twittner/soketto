@@ -15,34 +15,37 @@
 // See https://github.com/crossbario/autobahn-testsuite for details.
 
 use async_std::{net::{TcpListener, TcpStream}, prelude::*, task};
-use bytes::BytesMut;
-use soketto::{BoxedError, handshake};
+use soketto::{BoxedError, connection, handshake};
 
 fn main() -> Result<(), BoxedError> {
     env_logger::init();
     task::block_on(async {
-        let mut buf = BytesMut::new();
         let listener = TcpListener::bind("127.0.0.1:9001").await?;
         let mut incoming = listener.incoming();
         while let Some(s) = incoming.next().await {
             let mut s = new_server(s?);
             let key = {
-                let req = s.receive_request(&mut buf).await?;
+                let req = s.receive_request().await?;
                 req.into_key()
             };
             let accept = handshake::server::Response::Accept { key: &key, protocol: None };
-            s.send_response(&mut buf, &accept).await?;
+            s.send_response(&accept).await?;
             let mut c = s.into_connection(true);
             c.validate_utf8(true);
             loop {
-                let is_text = c.receive(&mut buf).await?;
-                if buf.is_empty() {
-                    break
-                }
-                if is_text {
-                    c.send_text(&mut buf).await?
-                } else {
-                    c.send_binary(&mut buf).await?
+                match c.receive().await {
+                    Ok((mut data, is_text)) => {
+                        if is_text {
+                            c.send_text(&mut data).await?
+                        } else {
+                            c.send_binary(&mut data).await?
+                        }
+                    }
+                    Err(connection::Error::Closed) => break,
+                    Err(e) => {
+                        log::error!("connection error: {}", e);
+                        return Err(e.into())
+                    }
                 }
             }
         }
