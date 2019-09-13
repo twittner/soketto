@@ -44,7 +44,7 @@ fn main() -> Result<(), BoxedError> {
                     Err(connection::Error::Closed) => break,
                     Err(e) => {
                         log::error!("connection error: {}", e);
-                        return Err(e.into())
+                        break
                     }
                 }
             }

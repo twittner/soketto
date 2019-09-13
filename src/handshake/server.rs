@@ -103,6 +103,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
         self.encode_response(r);
         self.socket.write_all(&self.buffer).await?;
         self.socket.flush().await?;
+        self.buffer.clear();
         Ok(())
     }
 

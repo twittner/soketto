@@ -100,6 +100,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
 
     /// Initiate client handshake request to server and get back the response.
     pub async fn handshake(&mut self) -> Result<ServerResponse, Error> {
+        self.buffer.clear();
         self.encode_request();
         self.socket.write_all(&self.buffer).await?;
         self.socket.flush().await?;
@@ -136,7 +137,6 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
 
     /// Encode the client handshake as a request, ready to be sent to the server.
     fn encode_request(&mut self) {
-        self.buffer.clear();
         let nonce: [u8; 16] = rand::random();
         self.nonce_offset = base64::encode_config_slice(&nonce, base64::STANDARD, &mut self.nonce);
         self.buffer.extend_from_slice(b"GET ");
