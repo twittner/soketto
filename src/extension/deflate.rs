@@ -10,7 +10,7 @@
 //!
 //! [rfc7692]: https://tools.ietf.org/html/rfc7692
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use crate::{
     BoxedError,
     base::{Header, OpCode},
@@ -35,7 +35,7 @@ const CLIENT_MAX_WINDOW_BITS: &str = "client_max_window_bits";
 pub struct Deflate {
     mode: Mode,
     enabled: bool,
-    buffer: Vec<u8>,
+    buffer: BytesMut,
     params: SmallVec<[Param<'static>; 2]>,
     our_max_window_bits: u8,
     their_max_window_bits: u8
@@ -57,7 +57,7 @@ impl Deflate {
         Deflate {
             mode,
             enabled: false,
-            buffer: Vec::new(),
+            buffer: BytesMut::new(),
             params,
             our_max_window_bits: 15,
             their_max_window_bits: 15
@@ -222,8 +222,8 @@ impl Extension for Deflate {
 
     fn decode(&mut self, header: &mut Header, data: &mut BytesMut) -> Result<(), BoxedError> {
         match header.opcode() {
-            OpCode::Binary | OpCode::Text if header.is_rsv1() && header.is_fin() => {}
-            OpCode::Continue if header.is_fin() => {}
+            | OpCode::Binary
+            | OpCode::Text if header.is_rsv1() => {}
             _ => return Ok(())
         }
         if data.is_empty() {
@@ -235,19 +235,23 @@ impl Extension for Deflate {
         while (d.total_in() as usize) < data.len() {
             let off = d.total_in() as usize;
             self.buffer.reserve(data.len() - off);
-            d.decompress_vec(&data[off ..], &mut self.buffer, FlushDecompress::Sync)?;
+            let n = d.total_out();
+            unsafe {
+                d.decompress(&data[off ..], self.buffer.bytes_mut(), FlushDecompress::Sync)?;
+                self.buffer.advance((d.total_out() - n) as usize)
+            }
         }
-        data.clear();
-        data.extend_from_slice(&self.buffer);
+        std::mem::swap(&mut self.buffer, data);
         header.set_rsv1(false);
+        header.set_payload_len(data.len());
         Ok(())
     }
 
     fn encode(&mut self, header: &mut Header, data: &mut BytesMut) -> Result<(), BoxedError> {
-        if let OpCode::Text | OpCode::Binary = header.opcode() {
-            // ok; continue
-        } else {
-            return Ok(())
+        match header.opcode() {
+            | OpCode::Binary
+            | OpCode::Text if !header.is_rsv1() => {}
+            _ => return Ok(())
         }
         if data.is_empty() {
             return Ok(())
@@ -257,17 +261,25 @@ impl Extension for Deflate {
         while (c.total_in() as usize) < data.len() {
             let off = c.total_in() as usize;
             self.buffer.reserve(data.len() - off);
-            c.compress_vec(&data[off ..], &mut self.buffer, FlushCompress::Sync)?;
+            let n = c.total_out();
+            unsafe {
+                c.compress(&data[off ..], self.buffer.bytes_mut(), FlushCompress::Sync)?;
+                self.buffer.advance((c.total_out() - n) as usize)
+            }
         }
-        if self.buffer.capacity() - self.buffer.len() < 5 {
+        if self.buffer.remaining_mut() < 5 {
             self.buffer.reserve(5); // Make room for the trailing end bytes
-            c.compress_vec(&[], &mut self.buffer, FlushCompress::Sync)?;
+            unsafe {
+                let n = c.total_out();
+                c.compress(&[], self.buffer.bytes_mut(), FlushCompress::Sync)?;
+                self.buffer.advance((c.total_out() - n) as usize)
+            }
         }
         let n = self.buffer.len() - 4;
         self.buffer.truncate(n); // Remove [0, 0, 0xFF, 0xFF]; cf. RFC 7692, section 7.2.1
-        data.clear();
-        data.extend_from_slice(&self.buffer);
+        std::mem::swap(&mut self.buffer, data);
         header.set_rsv1(true);
+        header.set_payload_len(data.len());
         Ok(())
     }
 }

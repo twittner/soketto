@@ -188,7 +188,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 }
             }
             self.codec.apply_mask(&header, &mut self.buffer[.. header.payload_len()]);
-            self.message.extend_from_slice(&self.buffer.split_to(header.payload_len()));
+            self.message.unsplit(self.buffer.split_to(header.payload_len()));
 
             // Handle message fragment logic.
             match (header.is_fin(), header.opcode()) {

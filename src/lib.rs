@@ -38,3 +38,4 @@ pub enum Parsing<T, N = ()> {
 pub(crate) fn as_u64(a: usize) -> u64 {
     a as u64
 }
+
