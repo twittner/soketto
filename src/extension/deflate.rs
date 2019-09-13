@@ -277,11 +277,14 @@ impl Extension for Deflate {
             trace!("deflate: not encoding {}", header);
             return Ok(())
         }
+
         if data.is_empty() {
             return Ok(())
         }
-        let mut c = Compress::new_with_window_bits(Compression::fast(), false, self.our_max_window_bits);
+
         self.buffer.clear();
+
+        let mut c = Compress::new_with_window_bits(Compression::fast(), false, self.our_max_window_bits);
         while c.total_in() < as_u64(data.len()) {
             let off: usize = c.total_in().try_into()?;
             self.buffer.reserve(data.len() - off);
@@ -299,11 +302,13 @@ impl Extension for Deflate {
                 self.buffer.advance_mut((c.total_out() - n).try_into()?)
             }
         }
+
         let n = self.buffer.len() - 4;
         self.buffer.truncate(n); // Remove [0, 0, 0xFF, 0xFF]; cf. RFC 7692, section 7.2.1
         std::mem::swap(&mut self.buffer, data);
         header.set_rsv1(true);
         header.set_payload_len(data.len());
+
         Ok(())
     }
 }

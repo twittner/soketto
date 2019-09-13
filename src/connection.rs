@@ -16,7 +16,7 @@ use smallvec::SmallVec;
 use static_assertions::const_assert;
 use std::{fmt, io};
 
-const BLOCK_SIZE: usize = 4096;
+const BLOCK_SIZE: usize = 8192;
 
 /// Is the [`Connection`] used by a client or server?
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -135,6 +135,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             e.encode(header, data).map_err(Error::Extension)?
         }
         write(self.mode, &mut self.codec, &mut self.socket, header, data, false).await?;
+        Ok(())
+    }
+
+    pub async fn flush(&mut self) -> Result<(), Error> {
+        if self.is_closed {
+            return Ok(())
+        }
+        self.socket.flush().await?;
         Ok(())
     }
 
