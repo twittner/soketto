@@ -14,6 +14,7 @@ use bytes::{BufMut, BytesMut};
 use crate::{Parsing, connection::{Connection, Mode}, extension::Extension};
 use futures::prelude::*;
 use http::StatusCode;
+use log::trace;
 use sha1::Sha1;
 use smallvec::SmallVec;
 use std::str;
@@ -86,7 +87,8 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
             }
             unsafe {
                 let n = self.socket.read(self.buffer.bytes_mut()).await?;
-                self.buffer.advance_mut(n)
+                self.buffer.advance_mut(n);
+                trace!("read {} bytes", n)
             }
             if let Parsing::Done { value, offset } = self.decode_request()? {
                 self.buffer.split_to(offset);

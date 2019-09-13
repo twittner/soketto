@@ -13,13 +13,15 @@
 use bytes::{BufMut, BytesMut};
 use crate::{
     BoxedError,
+    as_u64,
     base::{Header, OpCode},
     connection::Mode,
     extension::{Extension, Param}
 };
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
-use log::debug;
+use log::{debug, trace};
 use smallvec::SmallVec;
+use std::convert::TryInto;
 
 const SERVER_NO_CONTEXT_TAKEOVER: &str = "server_no_context_takeover";
 const SERVER_MAX_WINDOW_BITS: &str = "server_max_window_bits";
@@ -38,7 +40,8 @@ pub struct Deflate {
     buffer: BytesMut,
     params: SmallVec<[Param<'static>; 2]>,
     our_max_window_bits: u8,
-    their_max_window_bits: u8
+    their_max_window_bits: u8,
+    await_last_fragment: bool
 }
 
 impl Deflate {
@@ -60,7 +63,8 @@ impl Deflate {
             buffer: BytesMut::new(),
             params,
             our_max_window_bits: 15,
-            their_max_window_bits: 15
+            their_max_window_bits: 15,
+            await_last_fragment: false
         }
     }
 
@@ -222,49 +226,69 @@ impl Extension for Deflate {
 
     fn decode(&mut self, header: &mut Header, data: &mut BytesMut) -> Result<(), BoxedError> {
         match header.opcode() {
-            | OpCode::Binary
-            | OpCode::Text if header.is_rsv1() => {}
-            _ => return Ok(())
+            OpCode::Binary | OpCode::Text if header.is_rsv1() => {
+                if !header.is_fin() {
+                    self.await_last_fragment = true;
+                    trace!("deflate: not decoding {}; awaiting last fragment", header);
+                    return Ok(())
+                }
+                trace!("deflate: decoding {}", header)
+            }
+            OpCode::Continue if header.is_fin() && self.await_last_fragment => {
+                self.await_last_fragment = false;
+                trace!("deflate: decoding {}", header)
+            }
+            _ => {
+                trace!("deflate: not decoding {}", header);
+                return Ok(())
+            }
         }
+
         if data.is_empty() {
             return Ok(())
         }
+
         data.extend_from_slice(&[0, 0, 0xFF, 0xFF]); // cf. RFC 7692, section 7.2.2
+
         self.buffer.clear();
+
         let mut d = Decompress::new_with_window_bits(false, self.their_max_window_bits);
-        while (d.total_in() as usize) < data.len() {
-            let off = d.total_in() as usize;
+        while d.total_in() < as_u64(data.len()) {
+            let off: usize = d.total_in().try_into()?;
             self.buffer.reserve(data.len() - off);
             let n = d.total_out();
             unsafe {
                 d.decompress(&data[off ..], self.buffer.bytes_mut(), FlushDecompress::Sync)?;
-                self.buffer.advance((d.total_out() - n) as usize)
+                self.buffer.advance_mut((d.total_out() - n).try_into()?);
             }
         }
+
         std::mem::swap(&mut self.buffer, data);
         header.set_rsv1(false);
         header.set_payload_len(data.len());
+
         Ok(())
     }
 
     fn encode(&mut self, header: &mut Header, data: &mut BytesMut) -> Result<(), BoxedError> {
-        match header.opcode() {
-            | OpCode::Binary
-            | OpCode::Text if !header.is_rsv1() => {}
-            _ => return Ok(())
+        if let OpCode::Binary | OpCode::Text = header.opcode() {
+            trace!("deflate: encoding {}", header)
+        } else {
+            trace!("deflate: not encoding {}", header);
+            return Ok(())
         }
         if data.is_empty() {
             return Ok(())
         }
         let mut c = Compress::new_with_window_bits(Compression::fast(), false, self.our_max_window_bits);
         self.buffer.clear();
-        while (c.total_in() as usize) < data.len() {
-            let off = c.total_in() as usize;
+        while c.total_in() < as_u64(data.len()) {
+            let off: usize = c.total_in().try_into()?;
             self.buffer.reserve(data.len() - off);
             let n = c.total_out();
             unsafe {
                 c.compress(&data[off ..], self.buffer.bytes_mut(), FlushCompress::Sync)?;
-                self.buffer.advance((c.total_out() - n) as usize)
+                self.buffer.advance_mut((c.total_out() - n).try_into()?)
             }
         }
         if self.buffer.remaining_mut() < 5 {
@@ -272,7 +296,7 @@ impl Extension for Deflate {
             unsafe {
                 let n = c.total_out();
                 c.compress(&[], self.buffer.bytes_mut(), FlushCompress::Sync)?;
-                self.buffer.advance((c.total_out() - n) as usize)
+                self.buffer.advance_mut((c.total_out() - n).try_into()?)
             }
         }
         let n = self.buffer.len() - 4;

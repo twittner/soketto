@@ -89,7 +89,7 @@ impl OpCode {
 
 impl fmt::Display for OpCode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             OpCode::Continue => f.write_str("Continue"),
             OpCode::Text => f.write_str("Text"),
             OpCode::Binary => f.write_str("Binary"),
@@ -185,6 +185,20 @@ pub struct Header {
     opcode: OpCode,
     mask: u32,
     payload_len: usize
+}
+
+impl fmt::Display for Header {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "({} (fin {}) (rsv {}{}{}) (mask ({} {:x})) (len {}))",
+            self.opcode,
+            self.fin as u8,
+            self.rsv1 as u8,
+            self.rsv2 as u8,
+            self.rsv3 as u8,
+            self.masked as u8,
+            self.mask,
+            self.payload_len)
+    }
 }
 
 impl Header {

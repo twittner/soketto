@@ -10,7 +10,7 @@
 
 use bytes::{BufMut, BytesMut};
 use crate::{Parsing, base::{self, Header, OpCode}, extension::Extension};
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use futures::prelude::*;
 use smallvec::SmallVec;
 use static_assertions::const_assert;
@@ -145,7 +145,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// (when `false`). If `Connection::validate_utf8` is `true` and the
     /// return value is `Ok(true)`, `data` will be valid UTF-8.
     pub async fn receive(&mut self) -> Result<(BytesMut, bool), Error> {
-        let mut code = None;
+        let mut first_fragment_opcode = None;
         loop {
             if self.is_closed {
                 debug!("can not receive, connection is closed");
@@ -153,7 +153,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
 
             let mut header = self.receive_header().await?;
-            trace!("recv: {:?}", header);
+            trace!("recv: {}", header);
 
             // Handle control frames.
             if header.opcode().is_control() {
@@ -165,7 +165,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 while self.buffer.len() < header.payload_len() {
                     unsafe {
                         let n = self.socket.read(self.buffer.bytes_mut()).await?;
-                        self.buffer.advance_mut(n)
+                        self.buffer.advance_mut(n);
+                        trace!("read {} bytes", n)
                     }
                 }
                 let mut data = self.buffer.split_to(header.payload_len());
@@ -174,6 +175,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
 
             if self.message.len() + header.payload_len() > self.max_message_size {
+                warn!("accumulated message exceeds maximum");
                 return Err(Error::MessageTooLarge {
                     current: self.message.len() + header.payload_len(),
                     maximum: self.max_message_size
@@ -184,51 +186,48 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 self.buffer.reserve(std::cmp::max(BLOCK_SIZE, header.payload_len()));
                 unsafe {
                     let n = self.socket.read(self.buffer.bytes_mut()).await?;
-                    self.buffer.advance_mut(n)
+                    self.buffer.advance_mut(n);
+                    trace!("read {} bytes", n)
                 }
             }
             self.codec.apply_mask(&header, &mut self.buffer[.. header.payload_len()]);
             self.message.unsplit(self.buffer.split_to(header.payload_len()));
 
-            // Handle message fragment logic.
             match (header.is_fin(), header.opcode()) {
                 (false, OpCode::Continue) => { // Intermediate message fragment.
-                    if code.is_none() { // We have not received the initial message fragment.
+                    if first_fragment_opcode.is_none() {
+                        debug!("continue frame while not processing message fragments");
                         return Err(Error::UnexpectedOpCode(OpCode::Continue))
                     }
                     continue
                 }
                 (false, oc) => { // Initial message fragment.
-                    if code.is_some() { // We are already processing a fragmented message.
+                    if first_fragment_opcode.is_some() {
+                        debug!("initial fragment while already processing a fragmented message");
                         return Err(Error::UnexpectedOpCode(oc))
                     }
-                    // Save opcode so we can restore it at the end.
-                    code = Some(header.opcode());
+                    first_fragment_opcode = Some(oc);
+                    self.decode_with_extensions(&mut header)?;
                     continue
                 }
                 (true, OpCode::Continue) => { // Last message fragment.
-                    if let Some(c) = code.take() {
-                        // Restore opcode and set the payload length to the
-                        // accumulated length of all fragments.
-                        //
-                        // We do this so that extensions only operate on
-                        // non-fragmented messages.
-                        header.set_opcode(c);
+                    if let Some(oc) = first_fragment_opcode.take() {
                         header.set_payload_len(self.message.len());
-                    } else { // We are not processing message fragments at the moment.
+                        trace!("last fragement: accumulated length = {} bytes", self.message.len());
+                        self.decode_with_extensions(&mut header)?;
+                        header.set_opcode(oc);
+                    } else {
+                        debug!("last continue frame while not processing message fragments");
                         return Err(Error::UnexpectedOpCode(OpCode::Continue))
                     }
                 }
                 (true, oc) => { // Regular non-fragmented message.
-                    if code.is_some() { // But we are processing message fragments currently.
+                    if first_fragment_opcode.is_some() {
+                        debug!("regular message in the middle of fragmented message processing");
                         return Err(Error::UnexpectedOpCode(oc))
                     }
+                    self.decode_with_extensions(&mut header)?
                 }
-            }
-
-            for e in &mut self.extensions {
-                trace!("decoding with extension: {}", e.name());
-                e.decode(&mut header, &mut self.message).map_err(Error::Extension)?
             }
 
             let is_text = header.opcode() == OpCode::Text;
@@ -239,6 +238,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
 
             return Ok((self.message.take(), is_text))
         }
+    }
+
+    fn decode_with_extensions(&mut self, header: &mut Header) -> Result<(), Error> {
+        for e in &mut self.extensions {
+            trace!("decoding with extension: {}", e.name());
+            e.decode(header, &mut self.message).map_err(Error::Extension)?
+        }
+        Ok(())
     }
 
     /// Answer incoming control frames.
@@ -296,7 +303,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                     }
                     unsafe {
                         let n = self.socket.read(self.buffer.bytes_mut()).await?;
-                        self.buffer.advance_mut(n)
+                        self.buffer.advance_mut(n);
+                        trace!("read {} bytes", n)
                     }
                 }
             }
@@ -341,7 +349,7 @@ where
     }
     header.set_payload_len(data.len());
     let header_bytes = codec.encode_header(&header);
-    trace!("send: {:?}", header);
+    trace!("send: {}", header);
     socket.write_all(header_bytes).await?;
     if !data.is_empty() {
         socket.write_all(data).await?;
