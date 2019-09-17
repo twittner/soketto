@@ -15,55 +15,52 @@
 // See https://github.com/crossbario/autobahn-testsuite for details.
 
 use assert_matches::assert_matches;
-use async_std::{net::TcpStream, task};
 use soketto::{BoxedError, connection, handshake};
-use std::str::FromStr;
+use std::{net::TcpStream, str::FromStr};
 
 const SOKETTO_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> Result<(), BoxedError> {
     env_logger::init();
-    task::block_on(async {
-        let n = num_of_cases().await?;
-        for i in 1 ..= n {
-            if let Err(e) = run_case(i).await {
-                log::error!("case {}: {:?}", i, e)
-            }
+    let n = num_of_cases()?;
+    for i in 1 ..= n {
+        if let Err(e) = run_case(i) {
+            log::error!("case {}: {:?}", i, e)
         }
-        update_report().await?;
-        Ok(())
-    })
+    }
+    update_report()?;
+    Ok(())
 }
 
-async fn num_of_cases() -> Result<usize, BoxedError> {
-    let s = TcpStream::connect("127.0.0.1:9001").await?;
+fn num_of_cases() -> Result<usize, BoxedError> {
+    let s = TcpStream::connect("127.0.0.1:9001")?;
     let mut c = new_client(s, "/getCaseCount");
-    assert_matches!(c.handshake().await?, handshake::ServerResponse::Accepted {..});
+    assert_matches!(c.handshake()?, handshake::ServerResponse::Accepted {..});
     let mut c = c.into_connection(true);
-    let (payload, is_text) = c.receive().await?;
+    let (payload, is_text) = c.receive()?;
     assert!(is_text);
     let num = usize::from_str(std::str::from_utf8(&payload)?)?;
     log::info!("{} cases to run", num);
     Ok(num)
 }
 
-async fn run_case(n: usize) -> Result<(), BoxedError> {
+fn run_case(n: usize) -> Result<(), BoxedError> {
     log::info!("running case {}", n);
     let resource = format!("/runCase?case={}&agent=soketto-{}", n, SOKETTO_VERSION);
-    let s = TcpStream::connect("127.0.0.1:9001").await?;
+    let s = TcpStream::connect("127.0.0.1:9001")?;
     let mut c = new_client(s, &resource);
-    assert_matches!(c.handshake().await?, handshake::ServerResponse::Accepted {..});
+    assert_matches!(c.handshake()?, handshake::ServerResponse::Accepted {..});
     let mut c = c.into_connection(true);
     c.validate_utf8(true);
     loop {
-        match c.receive().await {
+        match c.receive() {
             Ok((mut payload, is_text)) => {
                 if is_text {
-                    c.send_text(&mut payload).await?
+                    c.send_text(&mut payload)?
                 } else {
-                    c.send_binary(&mut payload).await?
+                    c.send_binary(&mut payload)?
                 }
-                c.flush().await?
+                c.flush()?
             }
             Err(connection::Error::Closed) => return Ok(()),
             Err(e) => return Err(e.into())
@@ -71,13 +68,13 @@ async fn run_case(n: usize) -> Result<(), BoxedError> {
     }
 }
 
-async fn update_report() -> Result<(), BoxedError> {
+fn update_report() -> Result<(), BoxedError> {
     log::info!("requesting report generation");
     let resource = format!("/updateReports?agent=soketto-{}", SOKETTO_VERSION);
-    let s = TcpStream::connect("127.0.0.1:9001").await?;
+    let s = TcpStream::connect("127.0.0.1:9001")?;
     let mut c = new_client(s, &resource);
-    assert_matches!(c.handshake().await?, handshake::ServerResponse::Accepted {..});
-    c.into_connection(true).close().await?;
+    assert_matches!(c.handshake()?, handshake::ServerResponse::Accepted {..});
+    c.into_connection(true).close()?;
     Ok(())
 }
 

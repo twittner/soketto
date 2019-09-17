@@ -12,10 +12,9 @@
 
 use bytes::{BufMut, BytesMut};
 use crate::{Parsing, connection::{Connection, Mode}, extension::Extension};
-use futures::prelude::*;
 use sha1::Sha1;
 use smallvec::SmallVec;
-use std::str;
+use std::{io, str};
 use super::{
     Error,
     KEY,
@@ -53,7 +52,7 @@ pub struct Client<'a, T> {
     buffer: BytesMut
 }
 
-impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
+impl<'a, T: io::Read + io::Write> Client<'a, T> {
     /// Create a new client handshake for some host and resource.
     pub fn new(socket: T, host: &'a str, resource: &'a str) -> Self {
         Client {
@@ -98,18 +97,18 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
     }
 
     /// Initiate client handshake request to server and get back the response.
-    pub async fn handshake(&mut self) -> Result<ServerResponse, Error> {
+    pub fn handshake(&mut self) -> Result<ServerResponse, Error> {
         self.buffer.clear();
         self.encode_request();
-        self.socket.write_all(&self.buffer).await?;
-        self.socket.flush().await?;
+        self.socket.write_all(&self.buffer)?;
+        self.socket.flush()?;
         self.buffer.clear();
 
         loop {
             if !self.buffer.has_remaining_mut() {
                 self.buffer.reserve(BLOCK_SIZE)
             }
-            crate::read::<_, Error>(&mut self.socket, &mut self.buffer).await?;
+            crate::read::<_, Error>(&mut self.socket, &mut self.buffer)?;
             if let Parsing::Done { value, offset } = self.decode_response()? {
                 self.buffer.split_to(offset);
                 return Ok(value)

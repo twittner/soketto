@@ -17,7 +17,6 @@ pub mod handshake;
 pub mod connection;
 
 use bytes::{BufMut, BytesMut};
-use futures::io::{AsyncRead, AsyncReadExt};
 
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -43,9 +42,9 @@ pub(crate) fn as_u64(a: usize) -> u64 {
 }
 
 /// Helper to read from an `AsyncRead` resource into some buffer.
-pub(crate) async fn read<R, E>(r: &mut R, b: &mut BytesMut) -> Result<(), E>
+pub(crate) fn read<R, E>(r: &mut R, b: &mut BytesMut) -> Result<(), E>
 where
-    R: AsyncRead + Unpin,
+    R: std::io::Read,
     E: From<std::io::Error>
 {
     unsafe {
@@ -57,7 +56,7 @@ where
         // know if the memory is safe to read. Since we only
         // advance for as many bytes as we have read, usage is
         // safe here.
-        let n = r.read(b.bytes_mut()).await?;
+        let n = r.read(b.bytes_mut())?;
         b.advance_mut(n);
         log::trace!("read {} bytes", n)
     }

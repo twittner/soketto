@@ -12,11 +12,10 @@
 
 use bytes::{BufMut, BytesMut};
 use crate::{Parsing, connection::{Connection, Mode}, extension::Extension};
-use futures::prelude::*;
 use http::StatusCode;
 use sha1::Sha1;
 use smallvec::SmallVec;
-use std::str;
+use std::{io, str};
 use super::{
     Error,
     KEY,
@@ -44,7 +43,7 @@ pub struct Server<'a, T> {
     buffer: BytesMut
 }
 
-impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
+impl<'a, T: io::Read + io::Write> Server<'a, T> {
     /// Create a new server handshake.
     pub fn new(socket: T) -> Self {
         Server {
@@ -78,13 +77,13 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     /// Await an incoming client handshake request.
-    pub async fn receive_request(&mut self) -> Result<ClientRequest<'a>, Error> {
+    pub fn receive_request(&mut self) -> Result<ClientRequest<'a>, Error> {
         self.buffer.clear();
         loop {
             if !self.buffer.has_remaining_mut() {
                 self.buffer.reserve(BLOCK_SIZE)
             }
-            crate::read::<_, Error>(&mut self.socket, &mut self.buffer).await?;
+            crate::read::<_, Error>(&mut self.socket, &mut self.buffer)?;
             if let Parsing::Done { value, offset } = self.decode_request()? {
                 self.buffer.split_to(offset);
                 return Ok(value)
@@ -93,11 +92,11 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     }
 
     /// Respond to the client.
-    pub async fn send_response(&mut self, r: &Response<'_>) -> Result<(), Error> {
+    pub fn send_response(&mut self, r: &Response<'_>) -> Result<(), Error> {
         self.buffer.clear();
         self.encode_response(r);
-        self.socket.write_all(&self.buffer).await?;
-        self.socket.flush().await?;
+        self.socket.write_all(&self.buffer)?;
+        self.socket.flush()?;
         self.buffer.clear();
         Ok(())
     }

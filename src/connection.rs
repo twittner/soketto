@@ -11,7 +11,6 @@
 use bytes::{BufMut, BytesMut};
 use crate::{Parsing, base::{self, Header, OpCode}, extension::Extension};
 use log::{debug, trace, warn};
-use futures::prelude::*;
 use smallvec::SmallVec;
 use std::{fmt, io};
 
@@ -55,7 +54,7 @@ pub struct Connection<T> {
     max_message_size: usize
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
+impl<T: io::Read + io::Write> Connection<T> {
     /// Create a new `Connection` from the given socket.
     pub fn new(socket: T, mode: Mode) -> Self {
         Connection {
@@ -113,46 +112,45 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     }
 
     /// Send some binary data over this connection.
-    pub async fn send_binary(&mut self, data: &mut BytesMut) -> Result<(), Error> {
+    pub fn send_binary(&mut self, data: &mut BytesMut) -> Result<(), Error> {
         let mut header = Header::new(OpCode::Binary);
-        self.send(&mut header, data).await?;
+        self.send(&mut header, data)?;
         Ok(())
     }
 
     /// Send some text data over this connection.
-    pub async fn send_text(&mut self, data: &mut BytesMut) -> Result<(), Error> {
+    pub fn send_text(&mut self, data: &mut BytesMut) -> Result<(), Error> {
         debug_assert!(std::str::from_utf8(&data).is_ok());
         let mut header = Header::new(OpCode::Text);
-        self.send(&mut header, data).await?;
+        self.send(&mut header, data)?;
         Ok(())
     }
 
     /// Flush the socket buffer.
-    pub async fn flush(&mut self) -> Result<(), Error> {
+    pub fn flush(&mut self) -> Result<(), Error> {
         trace!("flushing connection");
         if self.is_closed {
             return Ok(())
         }
         if !self.wbuffer.is_empty() {
-            self.socket.write_all(&self.wbuffer).await?;
+            self.socket.write_all(&self.wbuffer)?;
             trace!("flushed {} bytes", self.wbuffer.len());
             self.wbuffer.clear()
         }
-        self.socket.flush().await?;
+        self.socket.flush()?;
         Ok(())
     }
 
     /// Send a close message and close the connection.
-    pub async fn close(&mut self) -> Result<(), Error> {
+    pub fn close(&mut self) -> Result<(), Error> {
         trace!("closing connection");
         if self.is_closed {
             return Ok(())
         }
         let mut header = Header::new(OpCode::Close);
         let mut code = 1000_u16.to_be_bytes(); // 1000 = normal closure
-        self.write(&mut header, &mut code[..]).await?;
-        self.flush().await?;
-        self.socket.close().await?;
+        self.write(&mut header, &mut code[..])?;
+        self.flush()?;
         self.is_closed = true;
         Ok(())
     }
@@ -160,7 +158,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// Send arbitrary websocket frames.
     ///
     /// Before sending, extensions will be applied to header and payload data.
-    async fn send(&mut self, header: &mut Header, data: &mut BytesMut) -> Result<(), Error> {
+    fn send(&mut self, header: &mut Header, data: &mut BytesMut) -> Result<(), Error> {
         if self.is_closed {
             debug!("can not send, connection is closed");
             return Err(Error::Closed)
@@ -169,7 +167,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             trace!("encoding with extension: {}", e.name());
             e.encode(header, data).map_err(Error::Extension)?
         }
-        self.write(header, data).await?;
+        self.write(header, data)?;
         Ok(())
     }
 
@@ -177,7 +175,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     ///
     /// The data will be masked if necessary.
     /// No extensions will be applied to header and payload data.
-    async fn write(&mut self, header: &mut Header, data: &mut [u8]) -> Result<(), Error> {
+    fn write(&mut self, header: &mut Header, data: &mut [u8]) -> Result<(), Error> {
         if self.mode.is_client() {
             header.set_masked(true);
             header.set_mask(rand::random());
@@ -186,7 +184,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         header.set_payload_len(data.len());
         trace!("send: {}", header);
         if self.wbuffer.len() > BLOCK_SIZE {
-            self.socket.write_all(&self.wbuffer).await?;
+            self.socket.write_all(&self.wbuffer)?;
             trace!("wrote {} bytes", self.wbuffer.len());
             self.wbuffer.clear()
         }
@@ -202,7 +200,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// The `bool` indicates if the data is textual (`true`) or binary
     /// (`false`). If `Connection::validate_utf8` is `true` textual data
     /// is checked for well-formed UTF-8 encoding before returned.
-    pub async fn receive(&mut self) -> Result<(BytesMut, bool), Error> {
+    pub fn receive(&mut self) -> Result<(BytesMut, bool), Error> {
         let mut first_fragment_opcode = None;
         loop {
             if self.is_closed {
@@ -210,16 +208,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 return Err(Error::Closed)
             }
 
-            let mut header = self.receive_header().await?;
+            let mut header = self.receive_header()?;
             trace!("recv: {}", header);
 
             // Handle control frames.
             if header.opcode().is_control() {
                 debug_assert!(header.payload_len() <= base::MAX_CTRL_BODY_SIZE);
-                self.read_buffer(&header).await?;
+                self.read_buffer(&header)?;
                 let mut data = self.rbuffer.split_to(header.payload_len());
                 self.codec.apply_mask(&header, &mut data);
-                self.on_control(&header, &mut data).await?;
+                self.on_control(&header, &mut data)?;
                 continue
             }
 
@@ -232,7 +230,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 })
             }
 
-            self.read_buffer(&header).await?;
+            self.read_buffer(&header)?;
             self.codec.apply_mask(&header, &mut self.rbuffer[.. header.payload_len()]);
             self.message.unsplit(self.rbuffer.split_to(header.payload_len()));
 
@@ -284,7 +282,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     }
 
     /// Read the next frame header.
-    async fn receive_header(&mut self) -> Result<Header, Error> {
+    fn receive_header(&mut self) -> Result<Header, Error> {
         if self.rbuffer.len() < base::MAX_HEADER_SIZE
             && self.rbuffer.remaining_mut() < base::MAX_HEADER_SIZE
         {
@@ -302,14 +300,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                     return Ok(header)
                 }
                 Parsing::NeedMore(_) => {
-                    crate::read::<_, Error>(&mut self.socket, &mut self.rbuffer).await?
+                    crate::read::<_, Error>(&mut self.socket, &mut self.rbuffer)?
                 }
             }
         }
     }
 
     /// Read more data into read buffer if necessary.
-    async fn read_buffer(&mut self, header: &Header) -> Result<(), Error> {
+    fn read_buffer(&mut self, header: &Header) -> Result<(), Error> {
         if header.payload_len() <= self.rbuffer.len() {
             return Ok(()) // We have enough data in our buffer.
         }
@@ -320,19 +318,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         self.rbuffer.reserve(std::cmp::max(BLOCK_SIZE, header.payload_len() - self.rbuffer.len()));
 
         while self.rbuffer.len() < header.payload_len() {
-            crate::read::<_, Error>(&mut self.socket, &mut self.rbuffer).await?
+            crate::read::<_, Error>(&mut self.socket, &mut self.rbuffer)?
         }
 
         Ok(())
     }
 
     /// Answer incoming control frames.
-    async fn on_control(&mut self, header: &Header, data: &mut BytesMut) -> Result<(), Error> {
+    fn on_control(&mut self, header: &Header, data: &mut BytesMut) -> Result<(), Error> {
         debug_assert_eq!(data.len(), header.payload_len());
         match header.opcode() {
             OpCode::Ping => {
                 let mut answer = Header::new(OpCode::Pong);
-                self.write(&mut answer, data).await?;
+                self.write(&mut answer, data)?;
                 Ok(())
             }
             OpCode::Pong => Ok(()),
@@ -340,12 +338,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 let (mut header, code) = close_answer(data)?;
                 if let Some(c) = code {
                     let mut data = c.to_be_bytes();
-                    self.write(&mut header, &mut data[..]).await?
+                    self.write(&mut header, &mut data[..])?
                 } else {
-                    self.write(&mut header, &mut []).await?
+                    self.write(&mut header, &mut [])?
                 }
-                self.flush().await?;
-                self.socket.close().await?;
+                self.flush()?;
                 self.is_closed = true;
                 Ok(())
             }

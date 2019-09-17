@@ -14,44 +14,42 @@
 //
 // See https://github.com/crossbario/autobahn-testsuite for details.
 
-use async_std::{net::{TcpListener, TcpStream}, prelude::*, task};
 use soketto::{BoxedError, connection, handshake};
+use std::net::{TcpListener, TcpStream};
 
 fn main() -> Result<(), BoxedError> {
     env_logger::init();
-    task::block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:9001").await?;
-        let mut incoming = listener.incoming();
-        while let Some(s) = incoming.next().await {
-            let mut s = new_server(s?);
-            let key = {
-                let req = s.receive_request().await?;
-                req.into_key()
-            };
-            let accept = handshake::server::Response::Accept { key: &key, protocol: None };
-            s.send_response(&accept).await?;
-            let mut c = s.into_connection(true);
-            c.validate_utf8(true);
-            loop {
-                match c.receive().await {
-                    Ok((mut data, is_text)) => {
-                        if is_text {
-                            c.send_text(&mut data).await?
-                        } else {
-                            c.send_binary(&mut data).await?
-                        }
-                        c.flush().await?
+    let listener = TcpListener::bind("127.0.0.1:9001")?;
+    let mut incoming = listener.incoming();
+    while let Some(s) = incoming.next() {
+        let mut s = new_server(s?);
+        let key = {
+            let req = s.receive_request()?;
+            req.into_key()
+        };
+        let accept = handshake::server::Response::Accept { key: &key, protocol: None };
+        s.send_response(&accept)?;
+        let mut c = s.into_connection(true);
+        c.validate_utf8(true);
+        loop {
+            match c.receive() {
+                Ok((mut data, is_text)) => {
+                    if is_text {
+                        c.send_text(&mut data)?
+                    } else {
+                        c.send_binary(&mut data)?
                     }
-                    Err(connection::Error::Closed) => break,
-                    Err(e) => {
-                        log::error!("connection error: {}", e);
-                        break
-                    }
+                    c.flush()?
+                }
+                Err(connection::Error::Closed) => break,
+                Err(e) => {
+                    log::error!("connection error: {}", e);
+                    break
                 }
             }
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "deflate"))]
