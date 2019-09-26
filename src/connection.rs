@@ -11,7 +11,7 @@
 use bytes::{BufMut, BytesMut};
 use crate::{Parsing, base::{self, Header, OpCode}, extension::Extension};
 use log::{debug, trace, warn};
-use futures::prelude::*;
+use futures::{prelude::*, lock::BiLock};
 use smallvec::SmallVec;
 use static_assertions::const_assert;
 use std::{fmt, io};
@@ -393,6 +393,31 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             e.decode(header, &mut self.message).map_err(Error::Extension)?
         }
         Ok(())
+    }
+
+    pub fn into_stream_and_sink(self) ->
+        (impl Stream<Item = Result<(BytesMut, bool), Error>>, impl Sink<BytesMut, Error = Error>)
+    {
+        let (a, b) = BiLock::new(self);
+
+        let stream = futures::stream::unfold(a, |c| async {
+            let next_item = c.lock().await.receive().await;
+            match next_item {
+                Err(Error::Closed) => None,
+                other => Some((other, c))
+            }
+        });
+
+        let sink = crate::sink::unfold(b, |c, cmd| async {
+            match cmd {
+                crate::sink::Command::Send(mut item) => c.lock().await.send_binary(&mut item).await?,
+                crate::sink::Command::Flush => c.lock().await.flush().await?,
+                crate::sink::Command::Close => c.lock().await.close().await?
+            }
+            Ok(c)
+        });
+
+        (stream, sink)
     }
 }
 
