@@ -100,7 +100,6 @@ pub mod base;
 pub mod extension;
 pub mod handshake;
 pub mod connection;
-mod sink;
 
 use bytes::{BufMut, BytesMut};
 use futures::io::{AsyncRead, AsyncReadExt};

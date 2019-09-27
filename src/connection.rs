@@ -408,11 +408,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
         });
 
-        let sink = crate::sink::unfold(b, |c, cmd| async {
+        let sink = quicksink::unfold(b, |c, cmd| async {
             match cmd {
-                crate::sink::Command::Send(mut item) => c.lock().await.send_binary(&mut item).await?,
-                crate::sink::Command::Flush => c.lock().await.flush().await?,
-                crate::sink::Command::Close => c.lock().await.close().await?
+                quicksink::Command::Send(mut item) => c.lock().await.send_binary(&mut item).await?,
+                quicksink::Command::Flush => c.lock().await.flush().await?,
+                quicksink::Command::Close => c.lock().await.close().await?
             }
             Ok(c)
         });
