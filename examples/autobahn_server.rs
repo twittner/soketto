@@ -30,16 +30,16 @@ fn main() -> Result<(), BoxedError> {
             };
             let accept = handshake::server::Response::Accept { key: &key, protocol: None };
             server.send_response(&accept).await?;
-            let mut websocket = server.into_connection();
+            let (mut sender, mut receiver) = server.into_connection();
             loop {
-                match websocket.receive().await {
+                match receiver.receive().await {
                     Ok((mut data, is_text)) => {
                         if is_text {
-                            websocket.send_text(&mut data).await?
+                            sender.send_text(&mut data).await?
                         } else {
-                            websocket.send_binary(&mut data).await?
+                            sender.send_binary(&mut data).await?
                         }
-                        websocket.flush().await?
+                        sender.flush().await?
                     }
                     Err(connection::Error::Closed) => break,
                     Err(e) => {

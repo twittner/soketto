@@ -39,8 +39,8 @@ async fn num_of_cases() -> Result<usize, BoxedError> {
     let socket = TcpStream::connect("127.0.0.1:9001").await?;
     let mut client = new_client(socket, "/getCaseCount");
     assert_matches!(client.handshake().await?, handshake::ServerResponse::Accepted {..});
-    let mut websocket = client.into_connection();
-    let (payload, is_text) = websocket.receive().await?;
+    let (_, mut receiver) = client.into_connection();
+    let (payload, is_text) = receiver.receive().await?;
     assert!(is_text);
     let num = usize::from_str(std::str::from_utf8(&payload)?)?;
     log::info!("{} cases to run", num);
@@ -53,16 +53,16 @@ async fn run_case(n: usize) -> Result<(), BoxedError> {
     let socket = TcpStream::connect("127.0.0.1:9001").await?;
     let mut client = new_client(socket, &resource);
     assert_matches!(client.handshake().await?, handshake::ServerResponse::Accepted {..});
-    let mut websocket = client.into_connection();
+    let (mut sender, mut receiver) = client.into_connection();
     loop {
-        match websocket.receive().await {
+        match receiver.receive().await {
             Ok((mut payload, is_text)) => {
                 if is_text {
-                    websocket.send_text(&mut payload).await?
+                    sender.send_text(&mut payload).await?
                 } else {
-                    websocket.send_binary(&mut payload).await?
+                    sender.send_binary(&mut payload).await?
                 }
-                websocket.flush().await?
+                sender.flush().await?
             }
             Err(connection::Error::Closed) => return Ok(()),
             Err(e) => return Err(e.into())
@@ -76,7 +76,7 @@ async fn update_report() -> Result<(), BoxedError> {
     let socket = TcpStream::connect("127.0.0.1:9001").await?;
     let mut client = new_client(socket, &resource);
     assert_matches!(client.handshake().await?, handshake::ServerResponse::Accepted {..});
-    client.into_connection().close().await?;
+    client.into_connection().0.close().await?;
     Ok(())
 }
 

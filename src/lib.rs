@@ -13,8 +13,9 @@
 //!
 //! To begin a websocket connection one first needs to perform a [handshake],
 //! either as [client] or [server], in order to upgrade from HTTP.
-//! Once successful, the client or server can transition to a [connection]
-//! and send and receive textual or binary data.
+//! Once successful, the client or server can transition to a connection,
+//! i.e. a [Sender]/[Receiver] pair and send and receive textual or
+//! binary data.
 //!
 //! ## Client
 //!
@@ -30,21 +31,19 @@
 //! let mut client = Client::new(socket, "...", "/");
 //!
 //! // And finally we perform the handshake and handle the result.
-//! let mut websocket = match client.handshake().await? {
+//! let (mut sender, mut receiver) = match client.handshake().await? {
 //!     ServerResponse::Accepted { .. } => client.into_connection(),
-//!     ServerResponse::Redirect { status_code, location } =>
-//!         unimplemented!("reconnect to the location URL"),
-//!     ServerResponse::Rejected { status_code } =>
-//!         unimplemented!("handle failure")
+//!     ServerResponse::Redirect { status_code, location } => unimplemented!("follow location URL"),
+//!     ServerResponse::Rejected { status_code } => unimplemented!("handle failure")
 //! };
 //!
 //! // Over the established websocket connection we can send
-//! websocket.send_text(&mut "some text".into()).await?;
-//! websocket.send_text(&mut "some more text".into()).await?;
-//! websocket.flush().await?;
+//! sender.send_text(&mut "some text".into()).await?;
+//! sender.send_text(&mut "some more text".into()).await?;
+//! sender.flush().await?;
 //!
 //! // ... and receive data.
-//! let (answer, is_text) = websocket.receive().await?;
+//! let (answer, is_text) = receiver.receive().await?;
 //!
 //! # Ok(())
 //! # });
@@ -76,14 +75,14 @@
 //!     server.send_response(&accept).await?;
 //!
 //!     // And we can finally transition to a websocket connection.
-//!     let mut websocket = server.into_connection();
-//!     let (mut message, is_text) = websocket.receive().await?;
+//!     let (mut sender, mut receiver) = server.into_connection();
+//!     let (mut message, is_text) = receiver.receive().await?;
 //!     if is_text {
-//!         websocket.send_text(&mut message).await?
+//!         sender.send_text(&mut message).await?
 //!     } else {
-//!         websocket.send_binary(&mut message).await?
+//!         sender.send_binary(&mut message).await?
 //!     }
-//!     websocket.close().await?;
+//!     sender.close().await?;
 //! }
 //!
 //! # Ok(())
@@ -92,7 +91,8 @@
 //! ```
 //! [client]: handshake::Client
 //! [server]: handshake::Server
-//! [connection]: connection::Connection
+//! [Sender]: connection::Sender
+//! [Receiver]: connection::Receiver
 //! [rfc6455]: https://tools.ietf.org/html/rfc6455
 //! [handshake]: https://tools.ietf.org/html/rfc6455#section-4
 
@@ -103,7 +103,6 @@ pub mod connection;
 
 use bytes::{BufMut, BytesMut};
 use futures::io::{AsyncRead, AsyncReadExt};
-
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
 /// A parsing result.
@@ -127,37 +126,25 @@ const fn as_u64(a: usize) -> u64 {
     a as u64
 }
 
+/// Reserve (and initialise) additional bytes.
+pub(crate) fn reserve(bytes: &mut BytesMut, additional: usize) {
+    let n = bytes.len();
+    bytes.resize(n + additional, 0);
+    unsafe { bytes.set_len(n) }
+}
+
 /// Helper to read from an `AsyncRead` resource into some buffer.
-pub(crate) async fn read<R, E>(r: &mut R, b: &mut BytesMut) -> Result<(), E>
+pub(crate) async fn read<R>(r: &mut R, b: &mut BytesMut) -> Result<(), std::io::Error>
 where
-    R: AsyncRead + Unpin,
-    E: From<std::io::Error>
+    R: AsyncRead + Unpin
 {
     unsafe {
-        // `bytes_mut()` is marked unsafe because it returns a
-        // reference to uninitialised memory. Since we do not
-        // read this memory and initialise it if necessary,
-        // usage is safe here.
-        //
-        // `advance_mut()` is marked unsafe because it can not
-        // know if the memory is safe to read. Since we only
-        // advance for as many bytes as we have read, usage is
-        // safe here.
-        initialise(b.bytes_mut());
         let n = r.read(b.bytes_mut()).await?;
+        if n == 0 && b.has_remaining_mut() {
+            return Err(std::io::ErrorKind::UnexpectedEof.into())
+        }
         b.advance_mut(n);
         log::trace!("read {} bytes", n)
     }
     Ok(())
 }
-
-/// Helper to initialise a slice by filling it with 0s.
-fn initialise(m: &mut [u8]) {
-    if cfg!(feature = "read_with_uninitialised_memory") {
-        return ()
-    }
-    unsafe {
-        std::ptr::write_bytes(m.as_mut_ptr(), 0, m.len())
-    }
-}
-
