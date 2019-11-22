@@ -10,6 +10,7 @@
 
 use bytes::{BufMut, BytesMut};
 use crate::{Parsing, base::{self, Header, MAX_HEADER_SIZE, OpCode}, extension::Extension};
+use crate::data::{Data, Incoming, Outgoing};
 use futures::{io::{BufWriter, ReadHalf, WriteHalf}, lock::BiLock, prelude::*, stream};
 use smallvec::SmallVec;
 use static_assertions::const_assert;
@@ -186,7 +187,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
     /// The `bool` indicates if the data is textual (`true`) or binary
     /// (`false`). If `Connection::validate_utf8` is `true` textual data
     /// is checked for well-formed UTF-8 encoding before returned.
-    pub async fn receive(&mut self) -> Result<(BytesMut, bool), Error> {
+    pub async fn receive(&mut self) -> Result<Incoming, Error> {
         let mut first_fragment_opcode = None;
         loop {
             if self.is_closed {
@@ -202,6 +203,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
                 self.read_buffer(&header).await?;
                 let mut data = self.buffer.split_to(header.payload_len());
                 base::Codec::apply_mask(&header, &mut data);
+                if header.opcode() == OpCode::Pong {
+                    return Ok(Incoming::Pong(data))
+                }
                 self.on_control(&header, &mut data).await?;
                 continue
             }
@@ -256,13 +260,28 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
                 }
             }
 
-            let is_text = header.opcode() == OpCode::Text;
-
-            if is_text && self.validate_utf8 {
-                std::str::from_utf8(&self.message)?;
+            if header.opcode() == OpCode::Text {
+                if self.validate_utf8 {
+                    std::str::from_utf8(&self.message)?;
+                }
+                return Ok(Data::Text(self.message.take()).into())
             }
 
-            return Ok((self.message.take(), is_text))
+            return Ok(Data::Binary(self.message.take()).into())
+        }
+    }
+
+    /// Receive the next websocket message, skipping over control frames.
+    ///
+    /// Fragmented messages will be concatenated and returned as one block.
+    /// The `bool` indicates if the data is textual (`true`) or binary
+    /// (`false`). If `Connection::validate_utf8` is `true` textual data
+    /// is checked for well-formed UTF-8 encoding before returned.
+    pub async fn receive_data(&mut self) -> Result<Data, Error> {
+        loop {
+            if let Incoming::Data(d) = self.receive().await? {
+                return Ok(d)
+            }
         }
     }
 
@@ -376,18 +395,28 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Sender<T> {
-    /// Send some binary data over this connection.
-    pub async fn send_binary(&mut self, data: impl Into<BytesMut>) -> Result<(), Error> {
-        let mut header = Header::new(OpCode::Binary);
-        self.send(&mut header, data.into()).await
+    /// Send some data or ping over this connection.
+    pub async fn send(&mut self, outgoing: Outgoing) -> Result<(), Error> {
+        match outgoing {
+            ping @ Outgoing::Ping(_) => {
+                let mut header = Header::new(OpCode::Ping);
+                self.send_frame(&mut header, ping).await
+            }
+            Outgoing::Data(d) => self.send_data(d).await
+        }
     }
 
-    /// Send some text data over this connection.
-    pub async fn send_text(&mut self, data: impl Into<BytesMut>) -> Result<(), Error> {
-        let bytes = data.into();
-        debug_assert!(std::str::from_utf8(&bytes).is_ok());
-        let mut header = Header::new(OpCode::Text);
-        self.send(&mut header, bytes).await
+    /// Send some data over this connection.
+    pub async fn send_data(&mut self, data: impl Into<Data>) -> Result<(), Error> {
+        let data = data.into();
+        let mut header = match &data {
+            Data::Binary(_) => Header::new(OpCode::Binary),
+            Data::Text(_) => {
+                debug_assert!(std::str::from_utf8(data.as_ref()).is_ok());
+                Header::new(OpCode::Text)
+            }
+        };
+        self.send_frame(&mut header, data.into()).await
     }
 
     /// Flush the socket buffer.
@@ -409,15 +438,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Sender<T> {
     /// Send arbitrary websocket frames.
     ///
     /// Before sending, extensions will be applied to header and payload data.
-    async fn send(&mut self, header: &mut Header, mut data: BytesMut) -> Result<(), Error> {
+    async fn send_frame(&mut self, header: &mut Header, mut data: Outgoing) -> Result<(), Error> {
         {
             let mut extensions = self.extensions.lock().await;
             for e in &mut *extensions {
                 log::trace!("encoding with extension: {}", e.name());
-                e.encode(header, &mut data).map_err(Error::Extension)?
+                e.encode(header, data.as_mut()).map_err(Error::Extension)?
             }
         }
-        self.write(header, &mut data).await
+        self.write(header, data.as_mut()).await
     }
 
     /// Write final header and payload data to socket.
@@ -469,7 +498,7 @@ fn close_answer(data: &[u8]) -> Result<(Header, Option<u16>), Error> {
 }
 
 /// Turn a [`Receiver`] into a [`futures::Stream`].
-pub fn into_stream<T>(r: Receiver<T>) -> impl stream::Stream<Item = Result<(BytesMut, bool), Error>>
+pub fn into_stream<T>(r: Receiver<T>) -> impl stream::Stream<Item = Result<Incoming, Error>>
 where
     T: AsyncRead + AsyncWrite + Unpin
 {
