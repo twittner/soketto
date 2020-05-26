@@ -8,19 +8,16 @@
 
 //! Types describing various forms of payload data.
 
-use bytes::BytesMut;
 use std::convert::TryFrom;
 
-/// Data received from the remote end.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Incoming {
+pub enum Incoming<'a> {
     /// Text or binary data.
     Data(Data),
-    /// Data sent with a PONG control frame.
-    Pong(Data)
+    Pong(&'a [u8])
 }
 
-impl Incoming {
+impl Incoming<'_> {
     /// Is this text or binary data?
     pub fn is_data(&self) -> bool {
         if let Incoming::Data(_) = self { true } else { false }
@@ -50,82 +47,23 @@ impl Incoming {
     }
 }
 
-impl AsRef<[u8]> for Incoming {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Incoming::Data(d) => d.as_ref(),
-            Incoming::Pong(d) => d.as_ref()
-        }
-    }
-}
-
-impl AsMut<[u8]> for Incoming {
-    fn as_mut(&mut self) -> &mut [u8] {
-        match self {
-            Incoming::Data(d) => d.as_mut(),
-            Incoming::Pong(d) => d.as_mut()
-        }
-    }
-}
-
-impl Into<Data> for Incoming {
-    fn into(self: Incoming) -> Data {
-        match self {
-            Incoming::Data(d) => d,
-            Incoming::Pong(d) => d
-        }
-    }
-}
-
-/// Application data.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Data(DataRepr);
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum DataRepr {
+pub enum Data {
     /// Binary data.
-    Binary(BytesMut),
+    Binary,
     /// UTF-8 encoded data.
-    Text(BytesMut)
+    Text
 }
 
 impl Data {
-    /// Create a new binary `Data` value.
-    pub(crate) fn binary(b: BytesMut) -> Self {
-        Data(DataRepr::Binary(b))
-    }
-
-    /// Create a new textual `Data` value.
-    pub(crate) fn text(b: BytesMut) -> Self {
-        Data(DataRepr::Text(b))
-    }
-
     /// Is this binary data?
     pub fn is_binary(&self) -> bool {
-        if let DataRepr::Binary(_) = self.0 { true } else { false }
+        if let Data::Binary = self { true } else { false }
     }
 
     /// Is this UTF-8 encoded textual data?
     pub fn is_text(&self) -> bool {
-        if let DataRepr::Text(_) = self.0 { true } else { false }
-    }
-}
-
-impl AsRef<[u8]> for Data {
-    fn as_ref(&self) -> &[u8] {
-        match &self.0 {
-            DataRepr::Binary(d) => d,
-            DataRepr::Text(d) => d
-        }
-    }
-}
-
-impl AsMut<[u8]> for Data {
-    fn as_mut(&mut self) -> &mut [u8] {
-        match &mut self.0 {
-            DataRepr::Binary(d) => d,
-            DataRepr::Text(d) => d
-        }
+        if let Data::Text = self { true } else { false }
     }
 }
 

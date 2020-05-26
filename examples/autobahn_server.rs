@@ -18,6 +18,7 @@ use async_std::{net::{TcpListener, TcpStream}, prelude::*, task};
 use soketto::{BoxedError, connection, handshake};
 
 fn main() -> Result<(), BoxedError> {
+    env_logger::init();
     task::block_on(async {
         let listener = TcpListener::bind("127.0.0.1:9001").await?;
         let mut incoming = listener.incoming();
@@ -30,17 +31,21 @@ fn main() -> Result<(), BoxedError> {
             let accept = handshake::server::Response::Accept { key: &key, protocol: None };
             server.send_response(&accept).await?;
             let (mut sender, mut receiver) = server.into_builder().finish();
+            let mut message = Vec::new();
             loop {
-                match receiver.receive_data().await {
-                    Ok(mut data) => {
-                        if data.is_binary() {
-                            sender.send_binary_mut(&mut data).await?;
-                        } else if let Ok(txt) = std::str::from_utf8(data.as_ref()) {
-                            sender.send_text(txt).await?
+                message.clear();
+                match receiver.receive_data(&mut message).await {
+                    Ok(soketto::Data::Binary) => {
+                        sender.send_binary_mut(&mut message).await?;
+                        sender.flush().await?
+                    }
+                    Ok(soketto::Data::Text) => {
+                        if let Ok(txt) = std::str::from_utf8(&message) {
+                            sender.send_text(txt).await?;
+                            sender.flush().await?
                         } else {
                             break
                         }
-                        sender.flush().await?
                     }
                     Err(connection::Error::Closed) => break,
                     Err(e) => {

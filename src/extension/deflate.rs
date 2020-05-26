@@ -10,7 +10,6 @@
 //!
 //! [rfc7692]: https://tools.ietf.org/html/rfc7692
 
-use bytes::{buf::BufMutExt, BytesMut};
 use crate::{
     as_u64,
     BoxedError,
@@ -37,7 +36,6 @@ const CLIENT_MAX_WINDOW_BITS: &str = "client_max_window_bits";
 pub struct Deflate {
     mode: Mode,
     enabled: bool,
-    buffer: crate::Buffer,
     params: SmallVec<[Param<'static>; 2]>,
     our_max_window_bits: u8,
     their_max_window_bits: u8,
@@ -60,7 +58,6 @@ impl Deflate {
         Deflate {
             mode,
             enabled: false,
-            buffer: crate::Buffer::new(),
             params,
             our_max_window_bits: 15,
             their_max_window_bits: 15,
@@ -226,7 +223,7 @@ impl Extension for Deflate {
         (true, false, false)
     }
 
-    fn decode(&mut self, header: &mut Header, data: &mut BytesMut) -> Result<(), BoxedError> {
+    fn decode(&mut self, header: &mut Header, data: &mut Vec<u8>) -> Result<(), BoxedError> {
         if data.is_empty() {
             return Ok(())
         }
@@ -253,8 +250,7 @@ impl Extension for Deflate {
         // Restore LEN and NLEN:
         data.extend_from_slice(&[0, 0, 0xFF, 0xFF]); // cf. RFC 7692, 7.2.2
 
-        self.buffer.clear();
-        let mut decoder = DeflateDecoder::new(self.buffer.take().into_bytes().writer());
+        let mut decoder = DeflateDecoder::new(io::Cursor::new(Vec::new()));
         decoder.write_all(&data)?;
         *data = decoder.finish()?.into_inner();
 
@@ -276,39 +272,38 @@ impl Extension for Deflate {
             return Ok(())
         }
 
-        self.buffer.clear();
-
         let mut encoder =
             Compress::new_with_window_bits(Compression::fast(), false, self.our_max_window_bits);
 
+        let mut buffer = vec![0; data.as_ref().len()];
+
         // Compress all input bytes.
         while encoder.total_in() < as_u64(data.as_ref().len()) {
-            let off: usize = encoder.total_in().try_into()?;
-            self.buffer.reserve(data.as_ref().len() - off);
-            let n = encoder.total_out();
-            encoder.compress(&data.as_ref()[off ..], self.buffer.bytes_mut(), FlushCompress::Sync)?;
-            self.buffer.advance_mut((encoder.total_out() - n).try_into()?)
+            let k: usize = encoder.total_in().try_into()?;
+            let n: usize = encoder.total_out().try_into()?;
+            encoder.compress(&data.as_ref()[k ..], &mut buffer[n ..], FlushCompress::Sync)?;
         }
 
+        buffer.truncate(encoder.total_out().try_into()?);
+
         // We need to append an empty deflate block if not there yet (RFC 7692, 7.2.1).
-        if !self.buffer.as_ref().ends_with(&[0, 0, 0xFF, 0xFF]) {
-            self.buffer.reserve(5); // Make sure there is room for the trailing end bytes.
-            let n = encoder.total_out();
-            encoder.compress(&[], self.buffer.bytes_mut(), FlushCompress::Sync)?;
-            self.buffer.advance_mut((encoder.total_out() - n).try_into()?)
+        if !buffer.ends_with(&[0, 0, 0xFF, 0xFF]) {
+            let i = buffer.len();
+            buffer.resize(i + 16, 0u8); // Make sure there is room for the trailing end bytes.
+            encoder.compress(&[], &mut buffer[i ..], FlushCompress::Sync)?;
+            buffer.truncate(encoder.total_out().try_into()?)
         }
 
         // If we still have not seen the empty deflate block appended, something is wrong.
-        if !self.buffer.as_ref().ends_with(&[0, 0, 0xFF, 0xFF]) {
+        if !buffer.ends_with(&[0, 0, 0xFF, 0xFF]) {
             log::error!("missing 00 00 FF FF");
             return Err(io::Error::new(io::ErrorKind::Other, "missing 00 00 FF FF").into())
         }
 
-        self.buffer.truncate(self.buffer.len() - 4); // Remove 00 00 FF FF; cf. RFC 7692, 7.2.1
-        let compressed = self.buffer.take().into_bytes();
+        buffer.truncate(buffer.len() - 4); // Remove 00 00 FF FF; cf. RFC 7692, 7.2.1
         header.set_rsv1(true);
-        header.set_payload_len(compressed.len());
-        *data = Storage::Owned(compressed);
+        header.set_payload_len(buffer.len());
+        *data = Storage::Owned(buffer);
 
         Ok(())
     }
