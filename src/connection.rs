@@ -13,8 +13,7 @@ use bytes::{Buf, BytesMut};
 use crate::{Storage, Parsing, base::{self, Header, MAX_HEADER_SIZE, OpCode}, extension::Extension};
 use crate::data::{ByteSlice125, Data, Incoming};
 use futures::{io::{BufWriter, ReadHalf, WriteHalf}, lock::BiLock, prelude::*, stream};
-use smallvec::SmallVec;
-use std::io;
+use std::{fmt, io, str};
 
 /// Write buffer capacity.
 const WRITE_BUFFER_SIZE: usize = 64 * 1024;
@@ -55,7 +54,7 @@ pub struct Sender<T> {
     codec: base::Codec,
     writer: BiLock<BufWriter<WriteHalf<T>>>,
     mask_buffer: Vec<u8>,
-    extensions: BiLock<SmallVec<[Box<dyn Extension + Send>; 4]>>,
+    extensions: BiLock<Vec<Box<dyn Extension + Send>>>,
     has_extensions: bool
 }
 
@@ -66,7 +65,7 @@ pub struct Receiver<T> {
     codec: base::Codec,
     reader: ReadHalf<T>,
     writer: BiLock<BufWriter<WriteHalf<T>>>,
-    extensions: BiLock<SmallVec<[Box<dyn Extension + Send>; 4]>>,
+    extensions: BiLock<Vec<Box<dyn Extension + Send>>>,
     has_extensions: bool,
     buffer: BytesMut,
     ctrl_buffer: BytesMut,
@@ -84,7 +83,7 @@ pub struct Builder<T> {
     mode: Mode,
     socket: T,
     codec: base::Codec,
-    extensions: SmallVec<[Box<dyn Extension + Send>; 4]>,
+    extensions: Vec<Box<dyn Extension + Send>>,
     buffer: BytesMut,
     max_message_size: usize
 }
@@ -105,7 +104,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Builder<T> {
             mode,
             socket,
             codec,
-            extensions: SmallVec::new(),
+            extensions: Vec::new(),
             buffer: BytesMut::new(),
             max_message_size: MAX_MESSAGE_SIZE
         }
@@ -509,52 +508,75 @@ fn close_answer(data: &[u8]) -> Result<(Header, Option<u16>), Error> {
     }
 }
 
-///// Turn a [`Receiver`] into a [`futures::Stream`].
-//pub fn into_stream<T>(r: Receiver<T>) -> impl stream::Stream<Item = Result<Vec<u8>, Error>>
-//where
-//    T: AsyncRead + AsyncWrite + Unpin
-//{
-//    stream::unfold(r, |mut r| async {
-//        let mut v = Vec::new();
-//        match r.receive(&mut v).await {
-//            Ok() => Some((Ok(item), r)),
-//            Err(Error::Closed) => None,
-//            Err(e) => Some((Err(e), r))
-//        }
-//    })
-//}
+/// Turn a [`Receiver`] into a [`futures::Stream`].
+pub fn into_stream<T>(r: Receiver<T>) -> impl stream::Stream<Item = Result<(Data, Vec<u8>), Error>>
+where
+    T: AsyncRead + AsyncWrite + Unpin
+{
+    stream::unfold(r, |mut r| async {
+        let mut v = Vec::new();
+        match r.receive_data(&mut v).await {
+            Ok(d) => Some((Ok((d, v)), r)),
+            Err(Error::Closed) => None,
+            Err(e) => Some((Err(e), r))
+        }
+    })
+}
 
 /// Errors which may occur when sending or receiving messages.
 #[non_exhaustive]
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum Error {
     /// An I/O error was encountered.
-    #[error("i/o error: {0}")]
-    Io(#[source] io::Error),
-
+    Io(io::Error),
     /// The base codec errored.
-    #[error("codec error: {0}")]
-    Codec(#[from] base::Error),
-
+    Codec(base::Error),
     /// An extension produced an error while encoding or decoding.
-    #[error("extension error: {0}")]
-    Extension(#[source] crate::BoxedError),
-
+    Extension(crate::BoxedError),
     /// An unexpected opcode was encountered.
-    #[error("unexpected opcode: {0}")]
     UnexpectedOpCode(OpCode),
-
     /// A close reason was not correctly UTF-8 encoded.
-    #[error("utf-8 opcode: {0}")]
-    Utf8(#[from] std::str::Utf8Error),
-
+    Utf8(str::Utf8Error),
     /// The total message payload data size exceeds the configured maximum.
-    #[error("message too large: len >= {current}, maximum = {maximum}")]
     MessageTooLarge { current: usize, maximum: usize },
-
     /// The connection is closed.
-    #[error("connection closed")]
     Closed
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::Io(e) =>
+                write!(f, "i/o error: {}", e),
+            Error::Codec(e) =>
+                write!(f, "codec error: {}", e),
+            Error::Extension(e) =>
+                write!(f, "extension error: {}", e),
+            Error::UnexpectedOpCode(c) =>
+                write!(f, "unexpected opcode: {}", c),
+            Error::Utf8(e) =>
+                write!(f, "utf-8 error: {}", e),
+            Error::MessageTooLarge { current, maximum } =>
+                write!(f, "message too large: len >= {}, maximum = {}", current, maximum),
+            Error::Closed =>
+                f.write_str("connection closed")
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            Error::Codec(e) => Some(e),
+            Error::Extension(e) => Some(&**e),
+            Error::Utf8(e) => Some(e),
+            Error::UnexpectedOpCode(_)
+            | Error::MessageTooLarge {..}
+            | Error::Closed
+            => None
+        }
+    }
 }
 
 impl From<io::Error> for Error {
@@ -566,3 +588,16 @@ impl From<io::Error> for Error {
         }
     }
 }
+
+impl From<str::Utf8Error> for Error {
+    fn from(e: str::Utf8Error) -> Self {
+        Error::Utf8(e)
+    }
+}
+
+impl From<base::Error> for Error {
+    fn from(e: base::Error) -> Self {
+        Error::Codec(e)
+    }
+}
+

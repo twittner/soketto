@@ -14,8 +14,7 @@ use bytes::{Buf, BytesMut};
 use crate::{Parsing, extension::Extension};
 use crate::connection::{self, Mode};
 use futures::prelude::*;
-use sha1::Sha1;
-use smallvec::SmallVec;
+use sha1::{Digest, Sha1};
 use std::{mem, str};
 use super::{
     Error,
@@ -47,9 +46,9 @@ pub struct Client<'a, T> {
     /// The offset into the nonce buffer.
     nonce_offset: usize,
     /// The protocols to include in the handshake.
-    protocols: SmallVec<[&'a str; 4]>,
+    protocols: Vec<&'a str>,
     /// The extensions the client wishes to include in the request.
-    extensions: SmallVec<[Box<dyn Extension + Send>; 4]>,
+    extensions: Vec<Box<dyn Extension + Send>>,
     /// Encoding/decoding buffer.
     buffer: BytesMut
 }
@@ -64,8 +63,8 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
             origin: None,
             nonce: [0; 32],
             nonce_offset: 0,
-            protocols: SmallVec::new(),
-            extensions: SmallVec::new(),
+            protocols: Vec::new(),
+            extensions: Vec::new(),
             buffer: BytesMut::new()
         }
     }
@@ -198,9 +197,9 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
         let nonce = &self.nonce[.. self.nonce_offset];
         with_first_header(&response.headers, "Sec-WebSocket-Accept", |theirs| {
             let mut digest = Sha1::new();
-            digest.update(nonce);
-            digest.update(KEY);
-            let ours = base64::encode(&digest.digest().bytes());
+            digest.input(nonce);
+            digest.input(KEY);
+            let ours = base64::encode(&digest.result());
             if ours.as_bytes() != theirs {
                 return Err(Error::InvalidSecWebSocketAccept)
             }

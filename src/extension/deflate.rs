@@ -19,7 +19,6 @@ use crate::{
     extension::{Extension, Param}
 };
 use flate2::{Compress, Compression, FlushCompress, write::DeflateDecoder};
-use smallvec::SmallVec;
 use std::{convert::TryInto, io::{self, Write}};
 
 const SERVER_NO_CONTEXT_TAKEOVER: &str = "server_no_context_takeover";
@@ -36,7 +35,7 @@ const CLIENT_MAX_WINDOW_BITS: &str = "client_max_window_bits";
 pub struct Deflate {
     mode: Mode,
     enabled: bool,
-    params: SmallVec<[Param<'static>; 2]>,
+    params: Vec<Param<'static>>,
     our_max_window_bits: u8,
     their_max_window_bits: u8,
     await_last_fragment: bool
@@ -46,9 +45,9 @@ impl Deflate {
     /// Create a new deflate extension either on client or server side.
     pub fn new(mode: Mode) -> Self {
         let params = match mode {
-            Mode::Server => SmallVec::new(),
+            Mode::Server => Vec::new(),
             Mode::Client => {
-                let mut params = SmallVec::new();
+                let mut params = Vec::new();
                 params.push(Param::new(SERVER_NO_CONTEXT_TAKEOVER));
                 params.push(Param::new(CLIENT_NO_CONTEXT_TAKEOVER));
                 params.push(Param::new(CLIENT_MAX_WINDOW_BITS));

@@ -18,7 +18,6 @@ use async_std::{net::{TcpListener, TcpStream}, prelude::*, task};
 use soketto::{BoxedError, connection, handshake};
 
 fn main() -> Result<(), BoxedError> {
-    env_logger::init();
     task::block_on(async {
         let listener = TcpListener::bind("127.0.0.1:9001").await?;
         let mut incoming = listener.incoming();

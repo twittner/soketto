@@ -8,7 +8,7 @@
 
 //! Types describing various forms of payload data.
 
-use std::convert::TryFrom;
+use std::{convert::TryFrom, fmt};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Incoming<'a> {
@@ -71,12 +71,17 @@ impl Data {
 #[derive(Debug)]
 pub struct ByteSlice125<'a>(&'a [u8]);
 
-static_assertions::const_assert_eq!(125, crate::base::MAX_CTRL_BODY_SIZE);
-
 /// Error, if converting to [`ByteSlice125`] fails.
-#[derive(Clone, Debug, thiserror::Error)]
-#[error("Slice larger than 125 bytes")]
+#[derive(Clone, Debug)]
 pub struct SliceTooLarge(());
+
+impl fmt::Display for SliceTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("Slice larger than 125 bytes")
+    }
+}
+
+impl std::error::Error for SliceTooLarge {}
 
 impl<'a> TryFrom<&'a [u8]> for ByteSlice125<'a> {
     type Error = SliceTooLarge;

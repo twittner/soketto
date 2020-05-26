@@ -15,8 +15,7 @@ use crate::{Parsing, extension::Extension};
 use crate::connection::{self, Mode};
 use futures::prelude::*;
 use http::StatusCode;
-use sha1::Sha1;
-use smallvec::SmallVec;
+use sha1::{Digest, Sha1};
 use std::{mem, str};
 use super::{
     Error,
@@ -38,9 +37,9 @@ const SOKETTO_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Server<'a, T> {
     socket: T,
     /// Protocols the server supports.
-    protocols: SmallVec<[&'a str; 4]>,
+    protocols: Vec<&'a str>,
     /// Extensions the server supports.
-    extensions: SmallVec<[Box<dyn Extension + Send>; 4]>,
+    extensions: Vec<Box<dyn Extension + Send>>,
     /// Encoding/decoding buffer.
     buffer: BytesMut
 }
@@ -50,8 +49,8 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
     pub fn new(socket: T) -> Self {
         Server {
             socket,
-            protocols: SmallVec::new(),
-            extensions: SmallVec::new(),
+            protocols: Vec::new(),
+            extensions: Vec::new(),
             buffer: BytesMut::new()
         }
     }
@@ -154,7 +153,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
             configure_extensions(&mut self.extensions, std::str::from_utf8(h.value)?)?
         }
 
-        let mut protocols = SmallVec::new();
+        let mut protocols = Vec::new();
         for p in request.headers.iter()
             .filter(|h| h.name.eq_ignore_ascii_case(SEC_WEBSOCKET_PROTOCOL))
         {
@@ -173,9 +172,9 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
                 let mut key_buf = [0; 32];
                 let accept_value = {
                     let mut digest = Sha1::new();
-                    digest.update(key);
-                    digest.update(KEY);
-                    let d = digest.digest().bytes();
+                    digest.input(key);
+                    digest.input(KEY);
+                    let d = digest.result();
                     let n = base64::encode_config_slice(&d, base64::STANDARD, &mut key_buf);
                     &key_buf[.. n]
                 };
@@ -209,7 +208,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Server<'a, T> {
 #[derive(Debug)]
 pub struct ClientRequest<'a> {
     ws_key: Vec<u8>,
-    protocols: SmallVec<[&'a str; 4]>
+    protocols: Vec<&'a str>
 }
 
 impl<'a> ClientRequest<'a> {
