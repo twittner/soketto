@@ -14,6 +14,7 @@
 //
 // See https://github.com/crossbario/autobahn-testsuite for details.
 
+use futures::io::{BufReader, BufWriter};
 use async_std::{net::{TcpListener, TcpStream}, prelude::*, task};
 use soketto::{BoxedError, connection, handshake};
 
@@ -59,12 +60,13 @@ fn main() -> Result<(), BoxedError> {
 }
 
 #[cfg(not(feature = "deflate"))]
-fn new_server<'a>(socket: TcpStream) -> handshake::Server<'a, TcpStream> {
-    handshake::Server::new(socket)
+fn new_server<'a>(socket: TcpStream) -> handshake::Server<'a, BufReader<BufWriter<TcpStream>>> {
+    handshake::Server::new(BufReader::new(BufWriter::new(socket)))
 }
 
 #[cfg(feature = "deflate")]
-fn new_server<'a>(socket: TcpStream) -> handshake::Server<'a, TcpStream> {
+fn new_server<'a>(socket: TcpStream) -> handshake::Server<'a, BufReader<BufWriter<TcpStream>>> {
+    let socket = BufReader::with_capacity(128 * 1024, BufWriter::with_capacity(128 * 1024, socket));
     let mut server = handshake::Server::new(socket);
     let deflate = soketto::extension::deflate::Deflate::new(soketto::Mode::Server);
     server.add_extension(Box::new(deflate));

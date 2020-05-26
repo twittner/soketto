@@ -12,11 +12,8 @@
 use bytes::{Buf, BytesMut};
 use crate::{Storage, Parsing, base::{self, Header, MAX_HEADER_SIZE, OpCode}, extension::Extension};
 use crate::data::{ByteSlice125, Data, DataType, Incoming};
-use futures::{io::{BufWriter, ReadHalf, WriteHalf}, lock::BiLock, prelude::*, stream};
+use futures::{io::{ReadHalf, WriteHalf}, lock::BiLock, prelude::*, stream};
 use std::{fmt, io, str};
-
-/// Write buffer capacity.
-const WRITE_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Accumulated max. size of a complete message.
 const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
@@ -52,7 +49,7 @@ impl Mode {
 pub struct Sender<T> {
     mode: Mode,
     codec: base::Codec,
-    writer: BiLock<BufWriter<WriteHalf<T>>>,
+    writer: BiLock<WriteHalf<T>>,
     mask_buffer: Vec<u8>,
     extensions: BiLock<Vec<Box<dyn Extension + Send>>>,
     has_extensions: bool
@@ -64,7 +61,7 @@ pub struct Receiver<T> {
     mode: Mode,
     codec: base::Codec,
     reader: ReadHalf<T>,
-    writer: BiLock<BufWriter<WriteHalf<T>>>,
+    writer: BiLock<WriteHalf<T>>,
     extensions: BiLock<Vec<Box<dyn Extension + Send>>>,
     has_extensions: bool,
     buffer: BytesMut,
@@ -147,7 +144,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Builder<T> {
     /// Create a configured [`Sender`]/[`Receiver`] pair.
     pub fn finish(self) -> (Sender<T>, Receiver<T>) {
         let (rhlf, whlf) = self.socket.split();
-        let (wrt1, wrt2) = BiLock::new(BufWriter::with_capacity(WRITE_BUFFER_SIZE, whlf));
+        let (wrt1, wrt2) = BiLock::new(whlf);
         let has_extensions = !self.extensions.is_empty();
         let (ext1, ext2) = BiLock::new(self.extensions);
 
@@ -317,8 +314,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
                     self.buffer.advance(offset);
                     return Ok(header)
                 }
-                Parsing::NeedMore(_) => {
-                    crate::read(&mut self.reader, &mut self.buffer, MAX_HEADER_SIZE).await?
+                Parsing::NeedMore(n) => {
+                    crate::read(&mut self.reader, &mut self.buffer, n).await?
                 }
             }
         }
@@ -480,7 +477,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Sender<T> {
 async fn write<T: AsyncWrite + Unpin>
     ( mode: Mode
     , codec: &mut base::Codec
-    , writer: &mut BiLock<BufWriter<WriteHalf<T>>>
+    , writer: &mut BiLock<WriteHalf<T>>
     , header: &mut Header
     , data: &mut Storage<'_>
     , mask_buffer: &mut Vec<u8>
