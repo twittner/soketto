@@ -19,7 +19,7 @@ use crate::{
     extension::{Extension, Param}
 };
 use flate2::{Compress, Compression, FlushCompress, write::DeflateDecoder};
-use std::{convert::TryInto, io::{self, Write}};
+use std::{convert::TryInto, io::{self, Write}, mem};
 
 const SERVER_NO_CONTEXT_TAKEOVER: &str = "server_no_context_takeover";
 const SERVER_MAX_WINDOW_BITS: &str = "server_max_window_bits";
@@ -35,6 +35,7 @@ const CLIENT_MAX_WINDOW_BITS: &str = "client_max_window_bits";
 pub struct Deflate {
     mode: Mode,
     enabled: bool,
+    buffer: Vec<u8>,
     params: Vec<Param<'static>>,
     our_max_window_bits: u8,
     their_max_window_bits: u8,
@@ -57,6 +58,7 @@ impl Deflate {
         Deflate {
             mode,
             enabled: false,
+            buffer: Vec::new(),
             params,
             our_max_window_bits: 15,
             their_max_window_bits: 15,
@@ -249,9 +251,11 @@ impl Extension for Deflate {
         // Restore LEN and NLEN:
         data.extend_from_slice(&[0, 0, 0xFF, 0xFF]); // cf. RFC 7692, 7.2.2
 
-        let mut decoder = DeflateDecoder::new(io::Cursor::new(Vec::new()));
+        self.buffer.clear();
+        let mut decoder = DeflateDecoder::new(&mut self.buffer);
         decoder.write_all(&data)?;
-        *data = decoder.finish()?.into_inner();
+        decoder.finish()?;
+        mem::swap(data, &mut self.buffer);
 
         header.set_rsv1(false);
         header.set_payload_len(data.len());
@@ -271,39 +275,43 @@ impl Extension for Deflate {
             return Ok(())
         }
 
+        self.buffer.clear();
+        self.buffer.resize(data.as_ref().len(), 0u8);
+
         let mut encoder =
             Compress::new_with_window_bits(Compression::fast(), false, self.our_max_window_bits);
-
-        let mut buffer = vec![0; data.as_ref().len()];
 
         // Compress all input bytes.
         while encoder.total_in() < as_u64(data.as_ref().len()) {
             let k: usize = encoder.total_in().try_into()?;
             let n: usize = encoder.total_out().try_into()?;
-            encoder.compress(&data.as_ref()[k ..], &mut buffer[n ..], FlushCompress::Sync)?;
+            encoder.compress(&data.as_ref()[k ..], &mut self.buffer[n ..], FlushCompress::Sync)?;
         }
 
-        buffer.truncate(encoder.total_out().try_into()?);
+        self.buffer.truncate(encoder.total_out().try_into()?);
 
         // We need to append an empty deflate block if not there yet (RFC 7692, 7.2.1).
-        if !buffer.ends_with(&[0, 0, 0xFF, 0xFF]) {
-            let i = buffer.len();
-            buffer.resize(i + 16, 0u8); // Make sure there is room for the trailing end bytes.
-            encoder.compress(&[], &mut buffer[i ..], FlushCompress::Sync)?;
-            buffer.truncate(encoder.total_out().try_into()?)
+        if !self.buffer.ends_with(&[0, 0, 0xFF, 0xFF]) {
+            let i = self.buffer.len();
+            self.buffer.resize(i + 16, 0u8); // Make sure there is room for the trailing end bytes.
+            encoder.compress(&[], &mut self.buffer[i ..], FlushCompress::Sync)?;
+            self.buffer.truncate(encoder.total_out().try_into()?)
         }
 
         // If we still have not seen the empty deflate block appended, something is wrong.
-        if !buffer.ends_with(&[0, 0, 0xFF, 0xFF]) {
+        if !self.buffer.ends_with(&[0, 0, 0xFF, 0xFF]) {
             log::error!("missing 00 00 FF FF");
             return Err(io::Error::new(io::ErrorKind::Other, "missing 00 00 FF FF").into())
         }
 
-        buffer.truncate(buffer.len() - 4); // Remove 00 00 FF FF; cf. RFC 7692, 7.2.1
+        self.buffer.truncate(self.buffer.len() - 4); // Remove 00 00 FF FF; cf. RFC 7692, 7.2.1
+        if let Storage::Owned(d) = data {
+            mem::swap(d, &mut self.buffer)
+        } else {
+            *data = Storage::Owned(mem::take(&mut self.buffer))
+        }
         header.set_rsv1(true);
-        header.set_payload_len(buffer.len());
-        *data = Storage::Owned(buffer);
-
+        header.set_payload_len(data.as_ref().len());
         Ok(())
     }
 }

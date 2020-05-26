@@ -11,7 +11,7 @@
 
 use bytes::{Buf, BytesMut};
 use crate::{Storage, Parsing, base::{self, Header, MAX_HEADER_SIZE, OpCode}, extension::Extension};
-use crate::data::{ByteSlice125, Data, Incoming};
+use crate::data::{ByteSlice125, Data, DataType, Incoming};
 use futures::{io::{BufWriter, ReadHalf, WriteHalf}, lock::BiLock, prelude::*, stream};
 use std::{fmt, io, str};
 
@@ -179,6 +179,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Builder<T> {
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
     /// Receive the next websocket message.
+    ///
+    /// The received frames forming the complete message will be appended to
+    /// the given `message` argument. The returned [`Incoming`] value describes
+    /// the type of data that was received, e.g. binary or textual data.
+    ///
+    /// Interleaved PONG frames are returned immediately as `Incoming::Pong`
+    /// values. If PONGs are not expected or uninteresting,
+    /// `Receiver::receive_data` may be used instead which skips over PONGs
+    /// and considers only application payload data.
     pub async fn receive(&mut self, message: &mut Vec<u8>) -> Result<Incoming<'_>, Error> {
         let mut first_fragment_opcode = None;
         loop {
@@ -212,15 +221,35 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
                 })
             }
 
-            if self.buffer.is_empty() {
-                let i = message.len();
-                message.resize(i + header.payload_len(), 0u8);
-                self.reader.read_exact(&mut message[i ..]).await?;
-                base::Codec::apply_mask(&header, &mut message[i ..]);
-            } else {
-                self.read_buffer(&header).await?;
-                base::Codec::apply_mask(&header, &mut self.buffer[.. header.payload_len()]);
-                message.extend_from_slice(&self.buffer.split_to(header.payload_len()))
+            // Get the frame's payload data bytes from buffer or socket.
+            {
+                let old_msg_len = message.len();
+
+                let bytes_to_read = {
+                    let required = header.payload_len();
+                    let buffered = self.buffer.len();
+
+                    if buffered == 0 {
+                        required
+                    } else if required > buffered {
+                        message.extend_from_slice(&self.buffer);
+                        self.buffer.clear();
+                        required - buffered
+                    } else {
+                        message.extend_from_slice(&self.buffer.split_to(required));
+                        0
+                    }
+                };
+
+                if bytes_to_read > 0 {
+                    let n = message.len();
+                    message.resize(n + bytes_to_read, 0u8);
+                    self.reader.read_exact(&mut message[n ..]).await?
+                }
+
+                debug_assert_eq!(header.payload_len(), message.len() - old_msg_len);
+
+                base::Codec::apply_mask(&header, &mut message[old_msg_len ..]);
             }
 
             match (header.is_fin(), header.opcode()) {
@@ -261,20 +290,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
             }
 
             if header.opcode() == OpCode::Text {
-                return Ok(Incoming::Data(Data::Text))
+                return Ok(Incoming::Text)
             } else {
-                return Ok(Incoming::Data(Data::Binary))
+                return Ok(Incoming::Binary)
             }
         }
     }
 
     /// Receive the next websocket message, skipping over control frames.
-    ///
-    /// Fragmented messages will be concatenated and returned as one block.
-    pub async fn receive_data(&mut self, message: &mut Vec<u8>) -> Result<Data, Error> {
+    pub async fn receive_data(&mut self, message: &mut Vec<u8>) -> Result<DataType, Error> {
         loop {
-            if let Incoming::Data(d) = self.receive(message).await? {
-                return Ok(d)
+            match self.receive(message).await? {
+                Incoming::Binary  => return Ok(DataType::Binary),
+                Incoming::Text    => return Ok(DataType::Text),
+                Incoming::Pong(_) => continue
             }
         }
     }
@@ -288,14 +317,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
                     self.buffer.advance(offset);
                     return Ok(header)
                 }
-                Parsing::NeedMore(n) => {
-                    crate::read(&mut self.reader, &mut self.buffer, n).await?
+                Parsing::NeedMore(_) => {
+                    crate::read(&mut self.reader, &mut self.buffer, MAX_HEADER_SIZE).await?
                 }
             }
         }
     }
 
-    /// Read more data into read buffer if necessary.
+    /// Read the complete payload data into the read buffer.
     async fn read_buffer(&mut self, header: &Header) -> Result<(), Error> {
         if header.payload_len() <= self.buffer.len() {
             return Ok(())
@@ -509,16 +538,17 @@ fn close_answer(data: &[u8]) -> Result<(Header, Option<u16>), Error> {
 }
 
 /// Turn a [`Receiver`] into a [`futures::Stream`].
-pub fn into_stream<T>(r: Receiver<T>) -> impl stream::Stream<Item = Result<(Data, Vec<u8>), Error>>
+pub fn into_data_stream<T>(r: Receiver<T>) -> impl stream::Stream<Item = Result<Data, Error>>
 where
     T: AsyncRead + AsyncWrite + Unpin
 {
     stream::unfold(r, |mut r| async {
         let mut v = Vec::new();
         match r.receive_data(&mut v).await {
-            Ok(d) => Some((Ok((d, v)), r)),
-            Err(Error::Closed) => None,
-            Err(e) => Some((Err(e), r))
+            Ok(DataType::Binary) => Some((Ok(Data::Binary(v)), r)),
+            Ok(DataType::Text)   => Some((Ok(Data::Text(v)), r)),
+            Err(Error::Closed)   => None,
+            Err(e)               => Some((Err(e), r))
         }
     })
 }

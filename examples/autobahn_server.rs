@@ -34,11 +34,11 @@ fn main() -> Result<(), BoxedError> {
             loop {
                 message.clear();
                 match receiver.receive_data(&mut message).await {
-                    Ok(soketto::Data::Binary) => {
+                    Ok(soketto::DataType::Binary) => {
                         sender.send_binary_mut(&mut message).await?;
                         sender.flush().await?
                     }
-                    Ok(soketto::Data::Text) => {
+                    Ok(soketto::DataType::Text) => {
                         if let Ok(txt) = std::str::from_utf8(&message) {
                             sender.send_text(txt).await?;
                             sender.flush().await?

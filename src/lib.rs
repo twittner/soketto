@@ -119,7 +119,7 @@ use futures::io::{AsyncRead, AsyncReadExt};
 use std::io;
 
 pub use connection::{Mode, Receiver, Sender};
-pub use data::{Data, Incoming};
+pub use data::{Data, DataType, Incoming};
 
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 

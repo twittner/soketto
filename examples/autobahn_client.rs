@@ -57,11 +57,11 @@ async fn run_case(n: usize) -> Result<(), BoxedError> {
     loop {
         message.clear();
         match receiver.receive_data(&mut message).await {
-            Ok(soketto::Data::Binary) => {
+            Ok(soketto::DataType::Binary) => {
                 sender.send_binary_mut(&mut message).await?;
                 sender.flush().await?
             }
-            Ok(soketto::Data::Text) => {
+            Ok(soketto::DataType::Text) => {
                 sender.send_text(std::str::from_utf8(&message)?).await?;
                 sender.flush().await?
             }

@@ -10,19 +10,20 @@
 
 use std::{convert::TryFrom, fmt};
 
+/// The various types of incoming data.
+///
+/// A PONG may be received unsolicited or as an answer to a PING.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Incoming<'a> {
-    /// Text or binary data.
-    Data(Data),
+    /// Textual data.
+    Text,
+    /// Binary data.
+    Binary,
+    /// PONG payload data.
     Pong(&'a [u8])
 }
 
 impl Incoming<'_> {
-    /// Is this text or binary data?
-    pub fn is_data(&self) -> bool {
-        if let Incoming::Data(_) = self { true } else { false }
-    }
-
     /// Is this a PONG?
     pub fn is_pong(&self) -> bool {
         if let Incoming::Pong(_) = self { true } else { false }
@@ -30,44 +31,58 @@ impl Incoming<'_> {
 
     /// Is this text data?
     pub fn is_text(&self) -> bool {
-        if let Incoming::Data(d) = self {
-            d.is_text()
-        } else {
-            false
-        }
+        if let Incoming::Text = self { true } else { false }
     }
 
     /// Is this binary data?
     pub fn is_binary(&self) -> bool {
-        if let Incoming::Data(d) = self {
-            d.is_binary()
-        } else {
-            false
-        }
+        if let Incoming::Binary = self { true } else { false }
     }
 }
 
+/// The types of payload data.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DataType {
+    /// Binary data.
+    Binary,
+    /// Textual data.
+    Text
+}
+
+impl DataType {
+    /// Is this binary data?
+    pub fn is_binary(&self) -> bool {
+        if let DataType::Binary = self { true } else { false }
+    }
+
+    /// Is this UTF-8 encoded textual data?
+    pub fn is_text(&self) -> bool {
+        if let DataType::Text = self { true } else { false }
+    }
+}
+
+/// Payload data.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Data {
     /// Binary data.
-    Binary,
+    Binary(Vec<u8>),
     /// UTF-8 encoded data.
-    Text
+    Text(Vec<u8>)
 }
 
 impl Data {
     /// Is this binary data?
     pub fn is_binary(&self) -> bool {
-        if let Data::Binary = self { true } else { false }
+        if let Data::Binary(_) = self { true } else { false }
     }
 
     /// Is this UTF-8 encoded textual data?
     pub fn is_text(&self) -> bool {
-        if let Data::Text = self { true } else { false }
+        if let Data::Text(_) = self { true } else { false }
     }
 }
 
-/// Wrapper which restricts the length of its byte slice to 125 bytes.
+/// Wrapper type which restricts the length of its byte slice to 125 bytes.
 #[derive(Debug)]
 pub struct ByteSlice125<'a>(&'a [u8]);
 
