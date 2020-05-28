@@ -50,7 +50,8 @@
 //! sender.flush().await?;
 //!
 //! // ... and receive data.
-//! let data = receiver.receive_data().await?;
+//! let mut data = Vec::new();
+//! receiver.receive_data(&mut data).await?;
 //!
 //! # Ok(())
 //! # });
@@ -84,12 +85,13 @@
 //!     // And we can finally transition to a websocket connection.
 //!     let (mut sender, mut receiver) = server.into_builder().finish();
 //!
-//!     let data = receiver.receive_data().await?;
+//!     let mut data = Vec::new();
+//!     let data_type = receiver.receive_data(&mut data).await?;
 //!
-//!     if data.is_text() {
-//!         sender.send_text(std::str::from_utf8(data.as_ref())?).await?
+//!     if data_type.is_text() {
+//!         sender.send_text(std::str::from_utf8(&data)?).await?
 //!     } else {
-//!         sender.send_binary(data.as_ref()).await?
+//!         sender.send_binary(&data).await?
 //!     }
 //!
 //!     sender.close().await?;
@@ -119,7 +121,7 @@ use futures::io::{AsyncRead, AsyncReadExt};
 use std::io;
 
 pub use connection::{Mode, Receiver, Sender};
-pub use data::{Data, DataType, Incoming};
+pub use data::{Data, Incoming};
 
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 

@@ -616,7 +616,6 @@ impl From<UnknownOpCode> for Error {
 
 #[cfg(test)]
 mod test {
-    use assert_matches::assert_matches;
     use crate::Parsing;
     use quickcheck::QuickCheck;
     use super::{OpCode, Codec, Error};
@@ -624,33 +623,33 @@ mod test {
     #[test]
     fn decode_partial_header() {
         let partial_header: &[u8] = &[0x89];
-        assert_matches! {
+        assert!(matches! {
             Codec::new().decode_header(partial_header),
             Ok(Parsing::NeedMore(1))
-        }
+        })
     }
 
     #[test]
     fn decode_partial_len() {
         let partial_length_1: &[u8] = &[0x89, 0xFE, 0x01];
-        assert_matches! {
+        assert!(matches! {
             Codec::new().decode_header(partial_length_1),
             Ok(Parsing::NeedMore(1))
-        }
+        });
         let partial_length_2: &[u8] = &[0x89, 0xFF, 0x01, 0x02, 0x03, 0x04];
-        assert_matches! {
+        assert!(matches! {
             Codec::new().decode_header(partial_length_2),
             Ok(Parsing::NeedMore(4))
-        }
+        })
     }
 
     #[test]
     fn decode_partial_mask() {
         let partial_mask: &[u8] = &[0x82, 0xFE, 0x01, 0x02, 0x00, 0x00];
-        assert_matches! {
+        assert!(matches! {
             Codec::new().decode_header(partial_mask),
             Ok(Parsing::NeedMore(2))
-        }
+        })
     }
 
     #[test]
@@ -667,10 +666,10 @@ mod test {
     fn decode_invalid_control_payload_len() {
         // Payload on control frame must be 125 bytes or less. 2nd byte must be 0xFD or less.
         let ctrl_payload_len : &[u8] = &[0x89, 0xFE, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert_matches! {
+        assert!(matches! {
             Codec::new().decode_header(ctrl_payload_len),
             Err(Error::InvalidControlFrameLen)
-        }
+        })
     }
 
     /// Checking that rsv1, rsv2, and rsv3 bit set returns error.
@@ -681,10 +680,10 @@ mod test {
         for res in &reserved {
             let mut buf = [0; 2];
             buf[0] |= *res;
-            assert_matches! {
+            assert!(matches! {
                 Codec::new().decode_header(&buf),
                 Err(Error::InvalidReservedBit(_))
-            }
+            })
         }
     }
 
@@ -695,10 +694,10 @@ mod test {
         for sb in &second_bytes {
             let mut buf = [0; 2];
             buf[0] |= *sb;
-            assert_matches! {
+            assert!(matches! {
                 Codec::new().decode_header(&buf),
                 Err(Error::FragmentedControl)
-            }
+            })
         }
     }
 
@@ -709,10 +708,10 @@ mod test {
         for res in &reserved {
             let mut buf = [0; 2];
             buf[0] |= 0x80 | *res;
-            assert_matches! {
+            assert!(matches! {
                 Codec::new().decode_header(&buf),
                 Err(Error::ReservedOpCode)
-            }
+            })
         }
     }
 

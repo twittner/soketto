@@ -37,7 +37,7 @@ fn main() -> Result<(), BoxedError> {
 async fn num_of_cases() -> Result<usize, BoxedError> {
     let socket = TcpStream::connect("127.0.0.1:9001").await?;
     let mut client = new_client(socket, "/getCaseCount");
-    matches!(client.handshake().await?, handshake::ServerResponse::Accepted {..});
+    assert!(matches!(client.handshake().await?, handshake::ServerResponse::Accepted {..}));
     let (_, mut receiver) = client.into_builder().finish();
     let mut data = Vec::new();
     let kind = receiver.receive_data(&mut data).await?;
@@ -52,17 +52,19 @@ async fn run_case(n: usize) -> Result<(), BoxedError> {
     let resource = format!("/runCase?case={}&agent=soketto-{}", n, SOKETTO_VERSION);
     let socket = TcpStream::connect("127.0.0.1:9001").await?;
     let mut client = new_client(socket, &resource);
-    matches!(client.handshake().await?, handshake::ServerResponse::Accepted {..});
+    assert!(matches!(client.handshake().await?, handshake::ServerResponse::Accepted {..}));
     let (mut sender, mut receiver) = client.into_builder().finish();
     let mut message = Vec::new();
     loop {
         message.clear();
         match receiver.receive_data(&mut message).await {
-            Ok(soketto::DataType::Binary) => {
+            Ok(soketto::Data::Binary(n)) => {
+                assert_eq!(n, message.len());
                 sender.send_binary_mut(&mut message).await?;
                 sender.flush().await?
             }
-            Ok(soketto::DataType::Text) => {
+            Ok(soketto::Data::Text(n)) => {
+                assert_eq!(n, message.len());
                 sender.send_text(std::str::from_utf8(&message)?).await?;
                 sender.flush().await?
             }
@@ -77,7 +79,7 @@ async fn update_report() -> Result<(), BoxedError> {
     let resource = format!("/updateReports?agent=soketto-{}", SOKETTO_VERSION);
     let socket = TcpStream::connect("127.0.0.1:9001").await?;
     let mut client = new_client(socket, &resource);
-    matches!(client.handshake().await?, handshake::ServerResponse::Accepted {..});
+    assert!(matches!(client.handshake().await?, handshake::ServerResponse::Accepted {..}));
     client.into_builder().finish().0.close().await?;
     Ok(())
 }
@@ -89,7 +91,7 @@ fn new_client(socket: TcpStream, path: &str) -> handshake::Client<'_, BufReader<
 
 #[cfg(feature = "deflate")]
 fn new_client(socket: TcpStream, path: &str) -> handshake::Client<'_, BufReader<BufWriter<TcpStream>>> {
-    let socket = BufReader::with_capacity(128 * 1024, BufWriter::with_capacity(128 * 1024, socket));
+    let socket = BufReader::with_capacity(8 * 1024, BufWriter::with_capacity(64 * 1024, socket));
     let mut client = handshake::Client::new(socket, "127.0.0.1:9001", path);
     let deflate = soketto::extension::deflate::Deflate::new(soketto::Mode::Client);
     client.add_extension(Box::new(deflate));

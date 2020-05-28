@@ -11,8 +11,8 @@
 
 use bytes::{Buf, BytesMut};
 use crate::{Storage, Parsing, base::{self, Header, MAX_HEADER_SIZE, OpCode}, extension::Extension};
-use crate::data::{ByteSlice125, Data, DataType, Incoming};
-use futures::{io::{ReadHalf, WriteHalf}, lock::BiLock, prelude::*, stream};
+use crate::data::{ByteSlice125, Data, Incoming};
+use futures::{io::{ReadHalf, WriteHalf}, lock::BiLock, prelude::*};
 use std::{fmt, io, str};
 
 /// Accumulated max. size of a complete message.
@@ -181,12 +181,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
     /// the given `message` argument. The returned [`Incoming`] value describes
     /// the type of data that was received, e.g. binary or textual data.
     ///
-    /// Interleaved PONG frames are returned immediately as `Incoming::Pong`
+    /// Interleaved PONG frames are returned immediately as `Data::Pong`
     /// values. If PONGs are not expected or uninteresting,
-    /// `Receiver::receive_data` may be used instead which skips over PONGs
+    /// [`Receiver::receive_data`] may be used instead which skips over PONGs
     /// and considers only application payload data.
     pub async fn receive(&mut self, message: &mut Vec<u8>) -> Result<Incoming<'_>, Error> {
         let mut first_fragment_opcode = None;
+        let mut length: usize = 0;
         loop {
             if self.is_closed {
                 log::debug!("can not receive, connection is closed");
@@ -209,13 +210,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
                 continue
             }
 
+            length = length.saturating_add(header.payload_len());
+
             // Check if total message does not exceed maximum.
-            if header.payload_len() + message.len() > self.max_message_size {
+            if length > self.max_message_size {
                 log::warn!("accumulated message length exceeds maximum");
-                return Err(Error::MessageTooLarge {
-                    current: message.len() + header.payload_len(),
-                    maximum: self.max_message_size
-                })
+                return Err(Error::MessageTooLarge { current: length, maximum: self.max_message_size })
             }
 
             // Get the frame's payload data bytes from buffer or socket.
@@ -287,20 +287,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
             }
 
             if header.opcode() == OpCode::Text {
-                return Ok(Incoming::Text)
+                return Ok(Incoming::Data(Data::Text(length)))
             } else {
-                return Ok(Incoming::Binary)
+                return Ok(Incoming::Data(Data::Binary(length)))
             }
         }
     }
 
     /// Receive the next websocket message, skipping over control frames.
-    pub async fn receive_data(&mut self, message: &mut Vec<u8>) -> Result<DataType, Error> {
+    pub async fn receive_data(&mut self, message: &mut Vec<u8>) -> Result<Data, Error> {
         loop {
-            match self.receive(message).await? {
-                Incoming::Binary  => return Ok(DataType::Binary),
-                Incoming::Text    => return Ok(DataType::Text),
-                Incoming::Pong(_) => continue
+            if let Incoming::Data(d) = self.receive(message).await? {
+                return Ok(d)
             }
         }
     }
@@ -532,22 +530,6 @@ fn close_answer(data: &[u8]) -> Result<(Header, Option<u16>), Error> {
         | 3000 ..= 4999 => Ok((answer, Some(code))), // acceptable codes
         _               => Ok((answer, Some(1002))) // invalid code => protocol error (1002)
     }
-}
-
-/// Turn a [`Receiver`] into a [`futures::Stream`].
-pub fn into_data_stream<T>(r: Receiver<T>) -> impl stream::Stream<Item = Result<Data, Error>>
-where
-    T: AsyncRead + AsyncWrite + Unpin
-{
-    stream::unfold(r, |mut r| async {
-        let mut v = Vec::new();
-        match r.receive_data(&mut v).await {
-            Ok(DataType::Binary) => Some((Ok(Data::Binary(v)), r)),
-            Ok(DataType::Text)   => Some((Ok(Data::Text(v)), r)),
-            Err(Error::Closed)   => None,
-            Err(e)               => Some((Err(e), r))
-        }
-    })
 }
 
 /// Errors which may occur when sending or receiving messages.

@@ -35,11 +35,13 @@ fn main() -> Result<(), BoxedError> {
             loop {
                 message.clear();
                 match receiver.receive_data(&mut message).await {
-                    Ok(soketto::DataType::Binary) => {
+                    Ok(soketto::Data::Binary(n)) => {
+                        assert_eq!(n, message.len());
                         sender.send_binary_mut(&mut message).await?;
                         sender.flush().await?
                     }
-                    Ok(soketto::DataType::Text) => {
+                    Ok(soketto::Data::Text(n)) => {
+                        assert_eq!(n, message.len());
                         if let Ok(txt) = std::str::from_utf8(&message) {
                             sender.send_text(txt).await?;
                             sender.flush().await?
@@ -66,7 +68,7 @@ fn new_server<'a>(socket: TcpStream) -> handshake::Server<'a, BufReader<BufWrite
 
 #[cfg(feature = "deflate")]
 fn new_server<'a>(socket: TcpStream) -> handshake::Server<'a, BufReader<BufWriter<TcpStream>>> {
-    let socket = BufReader::with_capacity(128 * 1024, BufWriter::with_capacity(128 * 1024, socket));
+    let socket = BufReader::with_capacity(8 * 1024, BufWriter::with_capacity(16 * 1024, socket));
     let mut server = handshake::Server::new(socket);
     let deflate = soketto::extension::deflate::Deflate::new(soketto::Mode::Server);
     server.add_extension(Box::new(deflate));
