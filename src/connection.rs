@@ -188,6 +188,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
     pub async fn receive(&mut self, message: &mut Vec<u8>) -> Result<Incoming<'_>, Error> {
         let mut first_fragment_opcode = None;
         let mut length: usize = 0;
+        let message_len = message.len();
         loop {
             if self.is_closed {
                 log::debug!("can not receive, connection is closed");
@@ -286,10 +287,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Receiver<T> {
                 }
             }
 
+            let num_bytes = message.len() - message_len;
+
             if header.opcode() == OpCode::Text {
-                return Ok(Incoming::Data(Data::Text(length)))
+                return Ok(Incoming::Data(Data::Text(num_bytes)))
             } else {
-                return Ok(Incoming::Data(Data::Binary(length)))
+                return Ok(Incoming::Data(Data::Binary(num_bytes)))
             }
         }
     }
